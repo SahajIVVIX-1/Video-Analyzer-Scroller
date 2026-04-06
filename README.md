@@ -8,6 +8,7 @@ The tools are grouped into the following independent sub-projects:
 
 - `video-folder-analyzer`: A tool to recursively analyze video formats/durations across directories and export a rich summary to an Excel file.
 - `pdf-scroller-generator`: A tool to convert tabular and non-tabular multi-page PDF documents into a smooth, continuously scrolling 1080p MP4 video.
+- `bhajan-video-generator`: A dedicated tool to render lyrics or verses into video format.
 
 ---
 
@@ -49,6 +50,16 @@ A utility explicitly designed to create clean scrolling video outputs from PDF d
 - Double click the built executable or run `python "PDF Scroller.py"` inside `pdf-scroller-generator`. 
 
 ---
+
+## 3. Bhajan Video Generator
+
+A specialized scripting tool for generating presentation or looping video files from Bhajan (hymn/lyric) data using OpenCV and Python.
+
+### Requirements
+- Python dependencies listed in the main scripts.
+
+### Usage
+- Execute the scripts available inside the `bhajan-video-generator` category directory.
 
 ## Building standalone versions
 
