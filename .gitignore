@@ -1,0 +1,22 @@
+# Ignore everything
+*
+
+# Allow directories to be scanned
+!*/
+
+# Specifically track only these extensions and files
+!*.py
+!.gitignore
+!README.md
+!SECURITY.md
+!requirements.txt
+
+# Re-ignore specific large directories just in case they have .py inside them
+poppler/
+ffmpeg-*/
+build/
+dist/
+__pycache__/
+env/
+venv/
+.venv/
