@@ -1,6 +1,7 @@
 import sys
 import os
 import gc
+import time
 from io import BytesIO
 from datetime import datetime
 
@@ -11,7 +12,7 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QDialog, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
                              QGraphicsLineItem, QSpinBox, QComboBox, QDoubleSpinBox,
                              QGraphicsRectItem, QGraphicsTextItem)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QDate, QRectF
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QDate, QRectF, QSettings
 from PyQt6.QtGui import QIcon, QFont, QPixmap, QPen, QColor, QCursor, QBrush
 
 # --- Processing Libraries ---
@@ -33,14 +34,56 @@ def get_poppler_path():
     Otherwise, returns the local development path.
     """
     if hasattr(sys, '_MEIPASS'):
-        # PyInstaller creates a temp folder and stores path in _MEIPASS
-        return os.path.join(sys._MEIPASS, 'poppler_bin')
-    
-    # Local development path
-    return r"C:/poppler-25.12.0/Library/bin"
+        # PyInstaller stores bundled data under _MEIPASS.
+        bundled_path = os.path.join(sys._MEIPASS, 'poppler_bin')
+        if os.path.exists(bundled_path):
+            bundled_data_path = os.path.join(sys._MEIPASS, 'poppler_share')
+            if os.path.exists(bundled_data_path):
+                os.environ['POPPLER_DATADIR'] = bundled_data_path
+            return bundled_path
+
+    # Local development fallback relative to this script.
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    local_path = os.path.join(script_dir, 'poppler-25.12.0', 'Library', 'bin')
+    local_data_path = os.path.join(script_dir, 'poppler-25.12.0', 'share', 'poppler')
+    if os.path.exists(local_data_path):
+        os.environ['POPPLER_DATADIR'] = local_data_path
+    return local_path
 
 POPPLER_BIN_PATH = get_poppler_path()
 POPPLER_PATH_UI = None  # Will be set from UI if user provides one 
+
+SETTINGS_ORG = "BhajanList"
+SETTINGS_APP = "VideoGenerator"
+
+def load_app_settings():
+    data = {"header_heights": {}}
+    try:
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        settings.beginGroup("header_heights")
+        for key in settings.childKeys():
+            value = settings.value(key)
+            try:
+                data["header_heights"][key] = int(float(value))
+            except Exception:
+                continue
+        settings.endGroup()
+    except Exception:
+        pass
+    return data
+
+def save_app_settings(settings_dict):
+    try:
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        settings.beginGroup("header_heights")
+        settings.remove("")
+        for key, value in settings_dict.get("header_heights", {}).items():
+            settings.setValue(key, int(value))
+        settings.endGroup()
+        settings.sync()
+        return True
+    except Exception:
+        return False
 
 # ==========================================
 # PART 1: YOUR ORIGINAL CORE LOGIC
@@ -111,8 +154,15 @@ def pdf_to_stitched_image(pdf_path, target_width=1920, log_callback=None):
                 log_callback("[→] Please update 'POPPLER_BIN_PATH' at the top of the script or set it via UI.")
             return None
 
-        # Reduced DPI from 300 to 200 to save memory and match preview
-        images = convert_from_path(pdf_path, dpi=200, poppler_path=poppler_path)
+        # Reduced DPI from 300 to 200 to save memory and match preview.
+        # Use multiple threads to speed up PDF rasterization.
+        thread_count = max(1, min(4, os.cpu_count() or 1))
+        images = convert_from_path(
+            pdf_path,
+            dpi=200,
+            poppler_path=poppler_path,
+            thread_count=thread_count
+        )
         
         if not images:
             if log_callback: log_callback("No pages found in PDF or conversion failed.")
@@ -172,111 +222,138 @@ def is_strip_white(image_pil, y_start, strip_height=15, threshold=245):
 
 def generate_and_write_frames_streaming(stitched_image, video_writer, fps, video_output_view_height,
                                         video_output_view_width, initial_static_duration_sec,
-                                        scroll_speed_pixels_per_second, 
+                                        scroll_speed_pixels_per_second,
                                         frozen_top_section_height_pixels,
                                         white_strip_check_height=15,
                                         white_strip_hold_duration_sec=0.2,
+                                        frame_progress_callback=None,
                                         log_callback=None):
     if stitched_image is None:
         return False
 
-    stitched_width, stitched_height = stitched_image.size
+    # Convert full stitched image once to OpenCV format (BGR).
+    full_img_bgr = cv2.cvtColor(np.array(stitched_image), cv2.COLOR_RGB2BGR)
+    stitched_height, stitched_width = full_img_bgr.shape[:2]
+    video_frame_width = min(video_output_view_width, stitched_width)
     effective_video_view_height = min(video_output_view_height, stitched_height)
-    video_frame_width = video_output_view_width
+
+    if effective_video_view_height <= 0 or video_frame_width <= 0:
+        return False
 
     if frozen_top_section_height_pixels >= effective_video_view_height:
-        frozen_top_section_height_pixels = effective_video_view_height // 2
+        frozen_top_section_height_pixels = max(0, effective_video_view_height // 2)
 
     scrolling_view_height = effective_video_view_height - frozen_top_section_height_pixels
-    frozen_top_image_pil = stitched_image.crop((0, 0, video_frame_width, frozen_top_section_height_pixels))
+
+    # Pre-allocate frame buffers once and reuse them for all frames.
+    frame_buffer = np.full(
+        (video_output_view_height, video_output_view_width, 3),
+        255,
+        dtype=np.uint8
+    )
+    static_frame = frame_buffer.copy()
+    static_frame[0:effective_video_view_height, 0:video_frame_width] = full_img_bgr[
+        0:effective_video_view_height,
+        0:video_frame_width
+    ]
+
+    if frozen_top_section_height_pixels > 0:
+        frozen_header = full_img_bgr[
+            0:frozen_top_section_height_pixels,
+            0:video_frame_width
+        ]
+    else:
+        frozen_header = None
+
+    # Pre-calculate white-strip candidates by Y coordinate once.
+    # A strip is considered white if >=98% pixels are above threshold in all channels.
+    threshold = 245
+    strip_h = max(1, int(white_strip_check_height))
+    white_mask = np.all(full_img_bgr[:, 0:video_frame_width] >= threshold, axis=2)
+    row_white_ratio = np.mean(white_mask, axis=1)
+    row_prefix = np.concatenate(([0.0], np.cumsum(row_white_ratio)))
+    y_indices = np.arange(stitched_height)
+    y_end = np.minimum(y_indices + strip_h, stitched_height)
+    window_heights = np.maximum(1, y_end - y_indices)
+    strip_white_ratio = (row_prefix[y_end] - row_prefix[y_indices]) / window_heights
+    white_strip_by_y = strip_white_ratio >= 0.98
 
     frame_count = 0
-    white_strip_first_seen_frame = -1
     transition_detected = False
+    white_strip_streak = 0
 
-    # Phase 1: Initial static display
-    initial_static_frames = int(fps * initial_static_duration_sec)
-    static_initial_frame_pil = stitched_image.crop((0, 0, video_frame_width, effective_video_view_height))
-    static_initial_frame_cv2 = cv2.cvtColor(np.array(static_initial_frame_pil), cv2.COLOR_RGB2BGR)
-
+    # Phase 1: Initial static display.
+    initial_static_frames = max(0, int(fps * initial_static_duration_sec))
     for _ in range(initial_static_frames):
-        video_writer.write(static_initial_frame_cv2)
+        video_writer.write(static_frame)
         frame_count += 1
+        if frame_progress_callback:
+            frame_progress_callback(1)
 
-    # Phase 2: Scrolling with white strip detection
+    # Phase 2: Scrolling with white-strip hold detection.
+    if scrolling_view_height <= 0:
+        return False
+
     scrollable_content_total_height = max(0, stitched_height - frozen_top_section_height_pixels)
     max_scroll_offset_for_content = max(0, scrollable_content_total_height - scrolling_view_height)
-    
-    if scroll_speed_pixels_per_second > 0:
-        total_scroll_duration_sec = scrollable_content_total_height / scroll_speed_pixels_per_second
+    scroll_increment_per_frame = (scroll_speed_pixels_per_second / fps) if fps > 0 else 0
+
+    if scroll_increment_per_frame <= 0:
+        total_scroll_frames = 1
     else:
-        total_scroll_duration_sec = 1
-    
-    scroll_frames = int(fps * total_scroll_duration_sec)
-    if scroll_frames == 0:
-        scroll_frames = 1
+        total_scroll_frames = max(1, int(max_scroll_offset_for_content / scroll_increment_per_frame) + 1)
 
-    scroll_increment_per_frame = max_scroll_offset_for_content / scroll_frames if scroll_frames > 0 else 0
-    white_strip_hold_frames = int(fps * white_strip_hold_duration_sec)
+    white_strip_hold_frames = max(1, int(fps * white_strip_hold_duration_sec))
 
-    if log_callback: log_callback(f"Generating frames...")
+    if log_callback:
+        log_callback(f"Generating frames (optimized): {total_scroll_frames} scroll frames...")
 
-    for j in range(scroll_frames):
+    for j in range(total_scroll_frames):
         current_content_scroll_offset = int(j * scroll_increment_per_frame)
-        current_content_scroll_offset = min(current_content_scroll_offset, max_scroll_offset_for_content)
+        if current_content_scroll_offset > max_scroll_offset_for_content:
+            current_content_scroll_offset = max_scroll_offset_for_content
 
-        # Check for white strip after the frozen header
-        check_y_position = frozen_top_section_height_pixels + current_content_scroll_offset
-        
-        if is_strip_white(stitched_image, check_y_position, white_strip_check_height):
-            if white_strip_first_seen_frame == -1:
-                white_strip_first_seen_frame = frame_count
-                # if log_callback: log_callback(f"⚡ White strip detected at offset {current_content_scroll_offset}px")
-            
-            # Check if we've held the white strip long enough
-            frames_since_white = frame_count - white_strip_first_seen_frame
-            if frames_since_white >= white_strip_hold_frames:
-                if log_callback: log_callback(f"[✂] Transition point at frame {frame_count}")
-                # Generate and write final frame
-                current_video_frame_pil = Image.new('RGB', (video_frame_width, effective_video_view_height), (255, 255, 255))
-                current_video_frame_pil.paste(frozen_top_image_pil, (0, 0))
-                
-                scrolling_crop_top = frozen_top_section_height_pixels + current_content_scroll_offset
-                scrolling_crop_bottom = min(stitched_height, scrolling_crop_top + scrolling_view_height)
-                
-                if scrolling_crop_top < stitched_height:
-                    scrolling_part_pil = stitched_image.crop((0, scrolling_crop_top, video_frame_width, scrolling_crop_bottom))
-                    current_video_frame_pil.paste(scrolling_part_pil, (0, frozen_top_section_height_pixels))
+        frame_buffer[:] = 255
 
-                frame_np = np.array(current_video_frame_pil)
-                frame_cv2 = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
-                video_writer.write(frame_cv2)
-                frame_count += 1
-                transition_detected = True
-                break
-        else:
-            white_strip_first_seen_frame = -1
-
-        # Generate and write frame immediately
-        current_video_frame_pil = Image.new('RGB', (video_frame_width, effective_video_view_height), (255, 255, 255))
-        current_video_frame_pil.paste(frozen_top_image_pil, (0, 0))
+        if frozen_header is not None:
+            frame_buffer[0:frozen_top_section_height_pixels, 0:video_frame_width] = frozen_header
 
         scrolling_crop_top = frozen_top_section_height_pixels + current_content_scroll_offset
         scrolling_crop_bottom = min(stitched_height, scrolling_crop_top + scrolling_view_height)
-        
-        if scrolling_crop_top < stitched_height:
-            scrolling_part_pil = stitched_image.crop((0, scrolling_crop_top, video_frame_width, scrolling_crop_bottom))
-            current_video_frame_pil.paste(scrolling_part_pil, (0, frozen_top_section_height_pixels))
 
-        frame_np = np.array(current_video_frame_pil)
-        frame_cv2 = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
-        video_writer.write(frame_cv2)
+        if scrolling_crop_top < stitched_height and scrolling_crop_bottom > scrolling_crop_top:
+            target_h = scrolling_crop_bottom - scrolling_crop_top
+            frame_buffer[
+                frozen_top_section_height_pixels:frozen_top_section_height_pixels + target_h,
+                0:video_frame_width
+            ] = full_img_bgr[scrolling_crop_top:scrolling_crop_bottom, 0:video_frame_width]
+
+        check_y_position = scrolling_crop_top
+        if 0 <= check_y_position < stitched_height and white_strip_by_y[check_y_position]:
+            white_strip_streak += 1
+            if white_strip_streak >= white_strip_hold_frames:
+                video_writer.write(frame_buffer)
+                frame_count += 1
+                if frame_progress_callback:
+                    frame_progress_callback(1)
+                transition_detected = True
+                if log_callback:
+                    log_callback(f"[✂] Transition point at frame {frame_count}")
+                break
+        else:
+            white_strip_streak = 0
+
+        video_writer.write(frame_buffer)
         frame_count += 1
+        if frame_progress_callback:
+            frame_progress_callback(1)
 
     return transition_detected
 
 def add_static_image_to_video(video_writer, image_path, duration_sec, fps, 
-                              video_width, video_height, log_callback=None):
+                              video_width, video_height,
+                              frame_progress_callback=None,
+                              log_callback=None):
     try:
         if not os.path.exists(image_path):
             if log_callback: log_callback(f"[✗] Error: Image not found at '{image_path}'. Skipping.")
@@ -299,6 +376,8 @@ def add_static_image_to_video(video_writer, image_path, duration_sec, fps,
         # Write frames
         for _ in range(num_frames):
             video_writer.write(image_cv2)
+            if frame_progress_callback:
+                frame_progress_callback(1)
         
         if log_callback: log_callback(f"[✓] Static image added successfully")
         return True
@@ -314,6 +393,7 @@ def add_static_image_to_video(video_writer, image_path, duration_sec, fps,
 class VideoWorker(QThread):
     progress_signal = pyqtSignal(str)  # Emits text logs
     progress_percent_signal = pyqtSignal(int)  # Emits progress percentage
+    progress_eta_signal = pyqtSignal(str)  # Emits ETA text
     finished_signal = pyqtSignal(str)  # Emits success/fail message
 
     def __init__(self, pdf_config_list, output_path, ending_img_path, ending_duration):
@@ -323,6 +403,78 @@ class VideoWorker(QThread):
         self.ending_image_path = ending_img_path
         self.ending_image_duration = ending_duration
         self.is_cancelled = False
+        self.total_estimated_frames = 1
+        self.frames_written = 0
+        self.start_time = None
+        self.last_progress_emit = 0.0
+
+    def estimate_frames_from_stitched_height(self, stitched_height, fps,
+                                             video_output_view_height,
+                                             initial_static_duration_sec,
+                                             scroll_speed_pixels_per_second,
+                                             frozen_top_section_height_pixels):
+        effective_video_view_height = min(video_output_view_height, stitched_height)
+        if effective_video_view_height <= 0:
+            return 1
+
+        if frozen_top_section_height_pixels >= effective_video_view_height:
+            frozen_top_section_height_pixels = max(0, effective_video_view_height // 2)
+
+        scrolling_view_height = max(0, effective_video_view_height - frozen_top_section_height_pixels)
+        initial_static_frames = max(0, int(fps * initial_static_duration_sec))
+
+        if scrolling_view_height <= 0 or scroll_speed_pixels_per_second <= 0 or fps <= 0:
+            return max(1, initial_static_frames)
+
+        scrollable_content_total_height = max(0, stitched_height - frozen_top_section_height_pixels)
+        max_scroll_offset_for_content = max(0, scrollable_content_total_height - scrolling_view_height)
+        scroll_increment_per_frame = scroll_speed_pixels_per_second / fps
+        scroll_frames = max(1, int(max_scroll_offset_for_content / scroll_increment_per_frame) + 1)
+
+        return max(1, initial_static_frames + scroll_frames)
+
+    def estimate_frames_from_page_count(self, pdf_path, fps, video_output_view_height,
+                                        initial_static_duration_sec,
+                                        scroll_speed_pixels_per_second,
+                                        frozen_top_section_height_pixels):
+        try:
+            page_count = len(PdfReader(pdf_path).pages) + 1  # +1 blank page added in temp PDF
+        except Exception:
+            page_count = 2
+
+        approx_resized_page_height = 2700
+        stitched_height_estimate = max(video_output_view_height, page_count * approx_resized_page_height)
+        return self.estimate_frames_from_stitched_height(
+            stitched_height_estimate,
+            fps,
+            video_output_view_height,
+            initial_static_duration_sec,
+            scroll_speed_pixels_per_second,
+            frozen_top_section_height_pixels
+        )
+
+    def _frames_written_callback(self, delta):
+        self.frames_written += delta
+        now = time.time()
+
+        if now - self.last_progress_emit < 0.2:
+            return
+
+        elapsed = max(0.001, now - self.start_time)
+        progress_ratio = min(1.0, self.frames_written / max(1, self.total_estimated_frames))
+        percent = int(progress_ratio * 100)
+        self.progress_percent_signal.emit(percent)
+
+        if self.frames_written > 0:
+            fps_effective = self.frames_written / elapsed
+            remaining_frames = max(0, self.total_estimated_frames - self.frames_written)
+            eta_sec = int(remaining_frames / max(0.001, fps_effective))
+        else:
+            eta_sec = 0
+
+        eta_m, eta_s = divmod(max(0, eta_sec), 60)
+        self.progress_eta_signal.emit(f"{eta_m:02d}:{eta_s:02d}")
+        self.last_progress_emit = now
 
     def log(self, message):
         self.progress_signal.emit(message)
@@ -350,12 +502,41 @@ class VideoWorker(QThread):
             total_frames_written = 0
             total_steps = len(self.pdf_config_list) + 1  # PDFs + ending image
 
+            # Initial estimate from input PDFs + ending image for smooth progress/ETA from start.
+            self.total_estimated_frames = 0
+            provisional_estimates = {}
+            for idx, config in enumerate(self.pdf_config_list):
+                input_pdf_path = config.get("pdf_path")
+                frozen_h = config.get("fixed_header_height_pixels", 300)
+                if input_pdf_path and os.path.exists(input_pdf_path):
+                    estimate = self.estimate_frames_from_page_count(
+                        input_pdf_path,
+                        fps,
+                        video_output_view_height,
+                        initial_static_duration_sec,
+                        scroll_speed_pixels_per_second,
+                        frozen_h
+                    )
+                else:
+                    estimate = int(fps * initial_static_duration_sec)
+                provisional_estimates[idx] = estimate
+                self.total_estimated_frames += estimate
+
+            ending_estimate = int(fps * self.ending_image_duration) if self.ending_image_path else 0
+            self.total_estimated_frames += ending_estimate
+            self.total_estimated_frames = max(1, self.total_estimated_frames)
+            self.frames_written = 0
+            self.start_time = time.time()
+            self.last_progress_emit = 0.0
+            self.progress_eta_signal.emit("calculating...")
+
             for idx, config in enumerate(self.pdf_config_list):
                 # Check if cancelled
                 if self.is_cancelled:
                     self.log("⚠ Process cancelled by user")
                     video_writer.release()
-                    self.finished_signal.emit("CANCELLED")
+                    elapsed_sec = int(time.time() - self.start_time)
+                    self.finished_signal.emit(f"CANCELLED|{elapsed_sec}")
                     return
                 
                 input_pdf_path = config.get("pdf_path")
@@ -376,6 +557,22 @@ class VideoWorker(QThread):
                     stitched_pdf_image = pdf_to_stitched_image(temp_pdf_path, target_width=video_output_view_width, log_callback=self.log)
 
                     if stitched_pdf_image:
+                        # Refine estimate using actual stitched height for better ETA.
+                        refined_estimate = self.estimate_frames_from_stitched_height(
+                            stitched_pdf_image.height,
+                            fps,
+                            video_output_view_height,
+                            initial_static_duration_sec,
+                            scroll_speed_pixels_per_second,
+                            fixed_header_height_pixels
+                        )
+                        provisional = provisional_estimates.get(idx, refined_estimate)
+                        self.total_estimated_frames = max(
+                            1,
+                            self.total_estimated_frames - provisional + refined_estimate
+                        )
+                        provisional_estimates[idx] = refined_estimate
+
                         transition_detected = generate_and_write_frames_streaming(
                             stitched_pdf_image,
                             video_writer,
@@ -387,13 +584,11 @@ class VideoWorker(QThread):
                             frozen_top_section_height_pixels=fixed_header_height_pixels,
                             white_strip_check_height=white_strip_check_height,
                             white_strip_hold_duration_sec=white_strip_hold_duration_sec,
+                            frame_progress_callback=self._frames_written_callback,
                             log_callback=self.log
                         )
 
                         self.log(f"[✓] Completed '{os.path.basename(input_pdf_path)}'")
-                        
-                        progress_percent = int(((idx + 1) / total_steps) * 100)
-                        self.progress_percent_signal.emit(progress_percent)
                         
                         del stitched_pdf_image
                         gc.collect()
@@ -410,15 +605,20 @@ class VideoWorker(QThread):
                 if self.is_cancelled:
                     self.log("[!] Process cancelled by user")
                     video_writer.release()
-                    self.finished_signal.emit("CANCELLED")
+                    elapsed_sec = int(time.time() - self.start_time)
+                    self.finished_signal.emit(f"CANCELLED|{elapsed_sec}")
                     return
                     
                 add_static_image_to_video(video_writer, self.ending_image_path, self.ending_image_duration, 
-                                          fps, video_output_view_width, video_output_view_height, log_callback=self.log)
+                                          fps, video_output_view_width, video_output_view_height,
+                                          frame_progress_callback=self._frames_written_callback,
+                                          log_callback=self.log)
                 self.progress_percent_signal.emit(100)
+                self.progress_eta_signal.emit("00:00")
 
             video_writer.release()
-            self.finished_signal.emit("SUCCESS")
+            elapsed_sec = int(time.time() - self.start_time)
+            self.finished_signal.emit(f"SUCCESS|{elapsed_sec}")
 
         except Exception as e:
             import traceback
@@ -1131,6 +1331,8 @@ class MainWindow(QWidget):
         # 2. File Inputs (Dictionary to store widgets and header heights)
         self.file_inputs = {}
         self.header_heights = {}  # Store dynamic header heights
+        self.current_eta_text = "--:--"
+        self.app_settings = load_app_settings()
         
         # Define the exact requirements
         self.requirements = [
@@ -1153,9 +1355,11 @@ class MainWindow(QWidget):
             
             btn = QPushButton("Browse")
             btn.setFixedWidth(70)
-            # Use lambda to bind the specific variable states
-            btn.clicked.connect(lambda checked, le=path_edit, t=type_key: self.browse_file(le, t))
-            
+            # Pass field label so Pradaxina selection can auto-fill sibling PDF fields.
+            btn.clicked.connect(
+                lambda checked, le=path_edit, t=type_key, lt=label_text: self.browse_file(le, t, lt)
+            )
+
             row.addWidget(lbl)
             row.addWidget(path_edit)
             row.addWidget(btn)
@@ -1188,6 +1392,13 @@ class MainWindow(QWidget):
             
             # Store reference
             self.file_inputs[label_text] = path_edit
+
+        # Apply persisted header defaults from previous runs
+        saved_headers = self.app_settings.get("header_heights", {})
+        if isinstance(saved_headers, dict):
+            for key, value in saved_headers.items():
+                if key in self.header_heights and isinstance(value, (int, float)):
+                    self.header_heights[key] = int(value)
 
         # 3. Output Folder
         out_row = QHBoxLayout()
@@ -1311,17 +1522,94 @@ class MainWindow(QWidget):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             new_height = dialog.get_header_height()
             self.header_heights[label_text] = new_height
+
+            # Persist for future runs as default header height per section.
+            self.app_settings.setdefault("header_heights", {})[label_text] = int(new_height)
+            save_app_settings(self.app_settings)
+
             QMessageBox.information(self, "Header Set", 
-                f"Header height for '{label_text}' set to {new_height}px")
+                f"Header height for '{label_text}' set to {new_height}px\nSaved as default for future use.")
     
-    def browse_file(self, line_edit, file_type):
+    def find_pdf_by_keywords(self, folder_path, keywords, exclude_paths=None):
+        """Return the best matching PDF in a folder using case-insensitive keyword matching."""
+        if not folder_path or not os.path.isdir(folder_path):
+            return None
+
+        exclude_set = set(os.path.normcase(p) for p in (exclude_paths or []))
+
+        best_path = None
+        best_score = -1
+
+        for entry in os.listdir(folder_path):
+            full_path = os.path.join(folder_path, entry)
+            if not os.path.isfile(full_path):
+                continue
+            if os.path.splitext(entry)[1].lower() != ".pdf":
+                continue
+            if os.path.normcase(full_path) in exclude_set:
+                continue
+
+            name_lower = os.path.splitext(entry)[0].lower()
+            score = sum(1 for kw in keywords if kw.lower() in name_lower)
+
+            if score > best_score and score > 0:
+                best_score = score
+                best_path = full_path
+
+        return best_path
+
+    def autofill_pdf_fields_from_pradaxina(self, pradaxina_path):
+        """Auto-fill Dandvat/Dhun/Kirtan from the same folder as selected Pradaxina PDF.
+        Also set export folder to the same directory."""
+        if not pradaxina_path or not os.path.exists(pradaxina_path):
+            return
+
+        source_folder = os.path.dirname(pradaxina_path)
+        filled_labels = []
+        excluded = [pradaxina_path]
+
+        keyword_map = {
+            "Dandvat PDF": ["dandvat", "dandawat", "dandavat"],
+            "Dhun PDF": ["dhun"],
+            "Kirtan PDF": ["kirtan", "kirtanam"]
+        }
+
+        for target_label, keywords in keyword_map.items():
+            target_edit = self.file_inputs.get(target_label)
+            if not target_edit:
+                continue
+
+            # Respect user's manual selection if field already has a valid file.
+            existing_path = target_edit.text().strip()
+            if existing_path and os.path.exists(existing_path):
+                excluded.append(existing_path)
+                continue
+
+            match_path = self.find_pdf_by_keywords(source_folder, keywords, exclude_paths=excluded)
+            if match_path:
+                target_edit.setText(match_path)
+                excluded.append(match_path)
+                filled_labels.append(target_label)
+
+        # Auto-set export folder to the same directory as Pradaxina PDF
+        self.out_path_edit.setText(source_folder)
+
+        if filled_labels:
+            friendly = ", ".join(label.replace(" PDF", "") for label in filled_labels)
+            self.log_area.append(f"[i] Auto-filled from Pradaxina folder: {friendly}")
+        
+        self.log_area.append(f"[i] Export folder set to: {source_folder}")
+
+    def browse_file(self, line_edit, file_type, label_text=""):
         if file_type == "pdf":
             fname, _ = QFileDialog.getOpenFileName(self, "Select PDF", "", "PDF Files (*.pdf)")
         else:
             fname, _ = QFileDialog.getOpenFileName(self, "Select Image", "", "Images (*.jpg *.jpeg *.png)")
-        
+
         if fname:
             line_edit.setText(fname)
+            if label_text == "Pradaxina PDF" and file_type == "pdf":
+                self.autofill_pdf_fields_from_pradaxina(fname)
 
     def browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
@@ -1378,7 +1666,6 @@ class MainWindow(QWidget):
         if hasattr(self, 'worker') and self.worker.isRunning():
             self.worker.is_cancelled = True
             self.log_area.append("[!] Cancelling process...")
-            self.cancel_btn.setEnabled(False)
     
     def start_processing(self):
         # Set Poppler path from UI if provided
@@ -1422,6 +1709,8 @@ class MainWindow(QWidget):
         self.start_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
         self.progress_bar.setValue(0)
+        self.current_eta_text = "--:--"
+        self.progress_bar.setFormat("0% | ETA: --:--")
         self.log_area.clear()
         self.log_area.append("[▶] Starting Process...")
         
@@ -1429,6 +1718,7 @@ class MainWindow(QWidget):
         self.worker = VideoWorker(pdf_configurations, full_output_path, ending_image, 3)
         self.worker.progress_signal.connect(self.update_log)
         self.worker.progress_percent_signal.connect(self.update_progress)
+        self.worker.progress_eta_signal.connect(self.update_eta)
         self.worker.finished_signal.connect(self.process_finished)
         self.worker.start()
 
@@ -1440,20 +1730,77 @@ class MainWindow(QWidget):
     
     def update_progress(self, percent):
         self.progress_bar.setValue(percent)
+        self.progress_bar.setFormat(f"{percent}% | ETA: {self.current_eta_text}")
 
-    def process_finished(self, status):
+    def update_eta(self, eta_text):
+        self.current_eta_text = eta_text
+        self.progress_bar.setFormat(f"{self.progress_bar.value()}% | ETA: {self.current_eta_text}")
+
+    def open_output_folder(self, folder_path):
+        """Open the output folder in file explorer."""
+        if not folder_path or not os.path.exists(folder_path):
+            QMessageBox.warning(self, "Folder Not Found", f"Could not find folder: {folder_path}")
+            return
+        
+        try:
+            if sys.platform == "win32":
+                os.startfile(folder_path)
+            elif sys.platform == "darwin":
+                os.system(f"open '{folder_path}'")
+            else:
+                os.system(f"xdg-open '{folder_path}'")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Could not open folder: {str(e)}")
+
+    def process_finished(self, status_with_time):
+        # Parse status and elapsed time
+        status_parts = status_with_time.split("|")
+        status = status_parts[0]
+        elapsed_sec = int(status_parts[1]) if len(status_parts) > 1 else 0
+        
+        # Reset UI to normal state
         self.start_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
+        self.progress_bar.setValue(0 if status == "CANCELLED" else 100)
+        self.current_eta_text = "--:--"
+        self.progress_bar.setFormat("0% | ETA: --:--")
         
         if status == "SUCCESS":
             self.progress_bar.setValue(100)
-            QMessageBox.information(self, "Done", f"Video Generated Successfully!\nSaved as: {self.date_input.date().toString('dd-MM-yyyy')}.mp4")
-            self.log_area.append("[✓] PROCESS COMPLETE")
+            self.progress_bar.setFormat("100% | ETA: 00:00")
+            
+            # Format elapsed time
+            min_elapsed, sec_elapsed = divmod(elapsed_sec, 60)
+            time_str = f"{min_elapsed}m {sec_elapsed}s" if min_elapsed > 0 else f"{sec_elapsed}s"
+            
+            output_path = getattr(self.worker, 'output_video_path', '')
+            output_folder = os.path.dirname(output_path) if output_path else self.out_path_edit.text()
+            
+            # Show completion message with time and folder open option
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Video Export Complete")
+            msg_box.setText(
+                f"✓ Video Generated Successfully!\n\n"
+                f"Time Taken: {time_str}\n\n"
+                f"Saved as: {self.date_input.date().toString('dd-MM-yyyy')}.mp4"
+            )
+            msg_box.setStandardButtons(QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Open)
+            msg_box.setDefaultButton(QMessageBox.StandardButton.Ok)
+            
+            result = msg_box.exec()
+            if result == QMessageBox.StandardButton.Open:
+                self.open_output_folder(output_folder)
+            
+            self.log_area.append(f"[✓] PROCESS COMPLETE (Time: {time_str})")
+            
         elif status == "CANCELLED":
             self.progress_bar.setValue(0)
-            QMessageBox.warning(self, "Cancelled", "Process was cancelled by user.")
+            self.progress_bar.setFormat("0% | ETA: --:--")
             self.log_area.append("[!] PROCESS CANCELLED")
+            
         else:
+            self.current_eta_text = "--:--"
+            self.progress_bar.setFormat(f"{self.progress_bar.value()}% | ETA: --:--")
             QMessageBox.critical(self, "Error", status)
             self.log_area.append("[✗] PROCESS FAILED")
 
