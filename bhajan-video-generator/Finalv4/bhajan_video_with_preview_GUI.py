@@ -854,6 +854,24 @@ class VideoWorker(QThread):
                 self.progress_eta_signal.emit("00:00")
 
             video_writer.release()
+            
+            # --- Inject Custom Metadata using Mutagen ---
+            try:
+                from mutagen.mp4 import MP4
+                video = MP4(self.output_video_path)
+                video["\xa9nam"] = "Bhajan-List-Video"
+                video["\xa9ART"] = "Chakhdi.local"
+                video["\xa9too"] = "Bhajan-List-Video-Generator.exe"
+                video["\xa9cmt"] = (
+                    "Made with Bhajan-List-Video-Generator.exe\n"
+                    "Available At https://github.com/SahajIVVIX-1/Video-Analyzer-Scroller\n"
+                    "Made by Chakhdi.local"
+                )
+                video.save()
+                self.log("[✓] Embedded custom metadata into the MP4 file.")
+            except Exception as meta_e:
+                self.log(f"[⚠] Warning: Could not inject metadata: {meta_e}")
+                
             elapsed_sec = int(time.time() - self.start_time)
             self.finished_signal.emit(f"SUCCESS|{elapsed_sec}")
 
