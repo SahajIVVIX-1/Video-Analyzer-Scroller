@@ -108,11 +108,11 @@ def pdf_to_stitched_image(pdf_path):
 
 def create_scrolling_video(stitched_image, output_path):
 
-    fps = 24
+    fps = 120
     video_w = 1920
     video_h = 1080
 
-    scroll_speed = 35
+    scroll_speed = 120
 
     start_hold = 2
     end_hold = 5
