@@ -23,7 +23,7 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-POPPLER_PATH = resource_path(os.path.join("poppler_bin", "Library", "bin"))
+POPPLER_PATH = r"P:\03_Projects\Video-Analyzer-Scroller\poppler-25.12.0\Library\bin"
 
 def trim_vertical_whitespace(pil_img, trim_top=True, trim_bottom=True):
 
