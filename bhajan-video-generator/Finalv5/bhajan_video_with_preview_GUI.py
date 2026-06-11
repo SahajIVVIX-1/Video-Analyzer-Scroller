@@ -123,7 +123,10 @@ if not os.path.exists(FFMPEG_BIN_PATH):
 
 def detect_ffmpeg_gpu_encoder():
     try:
-        result = subprocess.run([FFMPEG_BIN_PATH, "-encoders"], capture_output=True, text=True, check=False)
+        kwargs = {}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        result = subprocess.run([FFMPEG_BIN_PATH, "-encoders"], capture_output=True, text=True, check=False, **kwargs)
         output = result.stdout.lower()
         if "h264_nvenc" in output:
             return "h264_nvenc", "Hardware Acceleration: NVIDIA GPU Detected"
@@ -704,7 +707,10 @@ class VideoWorker(QThread):
             command.append(self.output_video_path)
             
             try:
-                ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                kwargs = {}
+                if sys.platform == "win32":
+                    kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL, **kwargs)
             except Exception as e:
                 self.log(f"⚠ FFmpeg Error: {e}. Cannot render video.")
                 self.finished_signal.emit(f"Error: FFmpeg failed to start - {e}")
@@ -1667,9 +1673,7 @@ class MainWindow(QWidget):
         self.new_instance_shortcut = QShortcut(QKeySequence("Ctrl+E"), self)
         self.new_instance_shortcut.activated.connect(self.open_new_instance)
         
-        # Setup Ctrl+R shortcut to restart the application
-        self.restart_shortcut = QShortcut(QKeySequence("Ctrl+R"), self)
-        self.restart_shortcut.activated.connect(self.restart_app)
+        # Ctrl+R shortcut removed
         
         # Apply Custom Theme based on provided palette
         self.setStyleSheet("""
@@ -2300,7 +2304,10 @@ class MainWindow(QWidget):
     def open_new_instance(self):
         # Launch a completely new and independent process of this application
         import sys
-        subprocess.Popen([sys.executable, sys.argv[0]])
+        kwargs = {}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        subprocess.Popen([sys.executable, sys.argv[0]], **kwargs)
 
     def restart_app(self):
         # Launch a new instance and then safely shut down this one
