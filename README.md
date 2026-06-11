@@ -16,7 +16,7 @@ This repository contains three independent, feature-rich tools designed to autom
 |------|-------------|
 | 📁 **[video-folder-analyzer](./video-folder-analyzer)** | Recursively analyzes video formats and durations across directories, exporting rich summaries to Excel. |
 | 📁 **[pdf-scroller-generator](./pdf-scroller-generator)** | Converts tabular and multi-page PDFs into smooth, continuously scrolling 1080p MP4 videos. |
-| 📁 **[bhajan-video-generator](./bhajan-video-generator)** | A highly specialized automation tool to merge multiple devotional PDFs into a single, perfectly stitched scrolling video with frozen headers. |
+| 📁 **[bhajan-video-generator](./bhajan-video-generator/Finalv5)** | A highly specialized automation tool to merge multiple devotional PDFs into a single, perfectly stitched scrolling video with frozen headers, hardware acceleration, and metadata injection. |
 
 ---
 
@@ -64,22 +64,25 @@ A specialized, production-ready desktop application for generating presentation-
 - **Interactive Header Cropping:** Features a custom Qt Graphics canvas allowing users to drag a boundary line and precisely define the "frozen header" area for each PDF.
 - **Smart Pausing:** Scans for horizontal "white strips" between content blocks, automatically pausing the video scroll to give viewers time to read.
 - **Automated Workflow:** Auto-fills related PDF fields (Dandvat, Dhun, Kirtan) based on keyword matching when a primary PDF (Pradaxina) is selected.
-- **Asynchronous Rendering:** Utilizes `QThread` for background OpenCV video generation, providing real-time progress bars and ETAs without freezing the UI.
+- **Hardware Acceleration:** Auto-detects and prioritizes advanced GPU encoders (NVIDIA NVENC, Intel QSV, AMD AMF) for vastly reduced rendering times, gracefully falling back to CPU (`libx264`).
+- **Smart Hotkey Navigation:** Streamlined UX with `Ctrl+Q` (Smart Safe-Exit), `Ctrl+R` (Restart Engine), `Ctrl+E` (New Window), and `Ctrl+W` (Clear UI) – fully aware of background export tasks.
+- **Native Metadata Injection:** Injects ISO-compliant formatted dates, copyright, and custom MP4 metadata natively through FFmpeg without losing `-movflags +faststart` thumbnail map optimizations.
+- **Asynchronous Rendering:** Utilizes `QThread` for background video generation, providing real-time progress bars, logs, and ETAs without freezing the UI.
 - **End-Card Transitions:** Seamlessly crossfades a final static image at the end of the video sequence.
 
 ### ⚙️ Requirements & Usage
 - **Dependencies:** `PyQt6`, `opencv-python`, `PyPDF2`, `pdf2image`, `Pillow`, `numpy`.
-- **Prerequisite:** Requires Poppler for PDF rasterization (can be configured directly in the app UI).
-- **Run:** `python bhajan_video_with_preview_GUI.py` inside the `bhajan-video-generator/Finalv2` directory.
+- **Prerequisite:** Requires Poppler for PDF rasterization and FFmpeg for video rendering.
+- **Run:** `python bhajan_video_with_preview_GUI.py` inside the `bhajan-video-generator/Finalv5` directory.
 
 ---
 
 ## 📦 Building Standalone Executables
 
 Each script is designed to be easily packaged into a portable, standalone `.exe` using **PyInstaller**. 
-For example, to build the Bhajan Video Generator with all dependencies and icons embedded:
+For example, to build the Bhajan Video Generator (Finalv5) with all icons embedded and FFmpeg statically bundled for complete independence:
 
 ```bash
-pyinstaller --noconfirm --onefile --windowed --icon "icon.png" --add-data "poppler-25.12.0/Library/bin;poppler_bin" --add-data "poppler-25.12.0/share/poppler;poppler_share" --add-data "icon.png;." bhajan_video_with_preview_GUI.py
+pyinstaller --noconfirm --onefile --windowed --icon="P:\03_Projects\Video-Analyzer-Scroller\bhajan-video-generator\Finalv5\icon.png" --add-data="P:\03_Projects\Video-Analyzer-Scroller\bhajan-video-generator\Finalv5\icon.png;." --add-data="P:\03_Projects\Video-Analyzer-Scroller\ffmpeg\bin\ffmpeg.exe;." "P:\03_Projects\Video-Analyzer-Scroller\bhajan-video-generator\Finalv5\bhajan_video_with_preview_GUI.py"
 ```
 *(Build artifacts like `dist/` and `build/` are ignored by `.gitignore`)*.
