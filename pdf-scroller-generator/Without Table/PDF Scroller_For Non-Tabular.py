@@ -54,7 +54,7 @@ def trim_vertical_whitespace(pil_img, trim_top=True, trim_bottom=True):
 
 def pdf_to_stitched_image(pdf_path):
 
-    images = convert_from_path(pdf_path, dpi=200, poppler_path=POPPLER_PATH)
+    images = convert_from_path(pdf_path, dpi=400, poppler_path=POPPLER_PATH)
 
     target_width = 1920
     resized = []
@@ -132,39 +132,68 @@ def create_scrolling_video(stitched_image, output_path):
         (video_w, video_h)
     )
 
-    # ===============================
-    # START HOLD
-    # ===============================
+    # ---------- START HOLD ----------
 
-    frame = stitched[0:video_h, :, :]
+    first_frame = stitched[0:video_h]
+
+    first_frame = cv2.cvtColor(first_frame, cv2.COLOR_RGB2BGR)
 
     for _ in range(int(start_hold * fps)):
-        writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        writer.write(first_frame)
 
-    # ===============================
-    # SCROLL
-    # ===============================
+    # ---------- SCROLL ----------
 
     step = scroll_speed / fps
 
-    y = 0
+    y = 0.0
 
     while y < max_scroll:
 
-        frame = stitched[int(y):int(y)+video_h, :, :]
+        whole = int(np.floor(y))
+        frac = y - whole
 
-        writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        crop = stitched[
+            whole: min(whole + video_h + 2, content_h),
+            :
+        ]
+
+        if crop.shape[0] < video_h + 2:
+
+            pad = np.full(
+                (video_h + 2 - crop.shape[0], video_w, 3),
+                255,
+                dtype=np.uint8
+            )
+
+            crop = np.vstack((crop, pad))
+
+        M = np.float32([
+            [1, 0, 0],
+            [0, 1, -frac]
+        ])
+
+        frame = cv2.warpAffine(
+            crop,
+            M,
+            (video_w, video_h),
+            flags=cv2.INTER_LANCZOS4,
+            borderMode=cv2.BORDER_REPLICATE
+        )
+
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+        writer.write(frame)
 
         y += step
 
-    # ===============================
-    # END HOLD
-    # ===============================
+    # ---------- END HOLD ----------
 
-    frame = stitched[int(max_scroll):int(max_scroll)+video_h, :, :]
+    last = stitched[int(max_scroll):int(max_scroll)+video_h]
+
+    last = cv2.cvtColor(last, cv2.COLOR_RGB2BGR)
 
     for _ in range(int(end_hold * fps)):
-        writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        writer.write(last)
 
     writer.release()
 
