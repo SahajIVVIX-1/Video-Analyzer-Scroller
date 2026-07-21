@@ -10,6 +10,7 @@
 !README.md
 !SECURITY.md
 !requirements.txt
+!*.bat
 
 # Re-ignore specific large directories just in case they have .py inside them
 poppler/

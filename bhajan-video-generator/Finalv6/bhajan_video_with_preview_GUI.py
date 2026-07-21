@@ -1,0 +1,3000 @@
+import sys
+import os
+import json
+import gc
+import time
+import subprocess
+from io import BytesIO
+from datetime import datetime
+
+def resource_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller"""
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(os.path.dirname(__file__))
+    return os.path.join(base_path, relative_path)
+
+# --- UI Imports ---
+from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
+                             QLabel, QPushButton, QFileDialog, QDateEdit, 
+                             QMessageBox, QProgressBar, QFrame, QLineEdit, QTextEdit,
+                             QDialog, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
+                             QGraphicsLineItem, QSpinBox, QComboBox, QDoubleSpinBox,
+                             QGraphicsRectItem, QGraphicsTextItem, QCheckBox, QSlider)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QDate, QRectF, QSettings, QRect, QPropertyAnimation, pyqtProperty, QEasingCurve, QPoint, QTimer
+from PyQt6.QtGui import QIcon, QFont, QPixmap, QPen, QColor, QCursor, QBrush, QPainter, QPainterPath, QKeySequence, QShortcut
+
+# --- Processing Libraries ---
+from PyPDF2 import PdfReader, PdfWriter
+from reportlab.pdfgen import canvas
+import fitz
+import numpy as np
+import cv2
+import queue
+import threading
+import subprocess
+
+class ModernToggleSwitch(QCheckBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(60, 26)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._position = 0.0 # Default to OFF position
+        self.animation = QPropertyAnimation(self, b"position")
+        self.animation.setEasingCurve(QEasingCurve.Type.InOutSine)
+        self.animation.setDuration(150)
+        self.stateChanged.connect(self.setup_animation)
+        
+    @pyqtProperty(float)
+    def position(self):
+        return self._position
+        
+    @position.setter
+    def position(self, pos):
+        self._position = pos
+        self.update()
+
+    def setup_animation(self, value):
+        self.animation.stop()
+        if value:
+            self.animation.setEndValue(1.0)
+        else:
+            self.animation.setEndValue(0.0)
+        self.animation.start()
+        
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        # Colors
+        bg_off = QColor("#111827")
+        bg_on = QColor("#10B981")
+        border_col = QColor("#334155")
+        knob_color = QColor("#F8FAFC")
+        text_color = QColor("#F8FAFC")
+        
+        # Draw background
+        rect = QRect(0, 0, self.width(), self.height())
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(rect), self.height()/2, self.height()/2)
+        
+        # Interpolate background color
+        current_bg = QColor(
+            int(bg_off.red() + (bg_on.red() - bg_off.red()) * self._position),
+            int(bg_off.green() + (bg_on.green() - bg_off.green()) * self._position),
+            int(bg_off.blue() + (bg_on.blue() - bg_off.blue()) * self._position),
+        )
+        
+        painter.setPen(QPen(border_col, 1))
+        painter.setBrush(QBrush(current_bg))
+        painter.drawPath(path)
+        
+        # Draw text
+        font = QFont("Segoe UI", 8, QFont.Weight.Bold)
+        painter.setFont(font)
+        painter.setPen(QPen(text_color))
+        if self.isChecked():
+            painter.drawText(QRect(8, 0, self.width() - 25, self.height()), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "ON")
+        else:
+            painter.drawText(QRect(20, 0, self.width() - 25, self.height()), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "OFF")
+            
+        # Draw knob
+        knob_radius = self.height() / 2 - 3
+        knob_x = 3 + (self.width() - 2 * knob_radius - 6) * self._position
+        knob_rect = QRectF(knob_x, 3, knob_radius * 2, knob_radius * 2)
+        
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(knob_color))
+        painter.drawEllipse(knob_rect)
+        
+        painter.end()
+
+    def hitButton(self, pos):
+        return self.rect().contains(pos)
+
+# ==========================================
+# ══ CONFIGURATION: FFMPEG HARDWARE ACCEL
+# ══════════════════════════════════════════
+FFMPEG_BIN_PATH = resource_path("ffmpeg.exe")
+if not os.path.exists(FFMPEG_BIN_PATH):
+    # Fallback for local development before compiling to EXE
+    FFMPEG_BIN_PATH = r"P:\03_Projects\Video-Analyzer-Scroller\bhajan-video-generator\ffmpeg-8.1.2\bin\ffmpeg.exe"
+
+def detect_ffmpeg_gpu_encoder():
+    try:
+        kwargs = {}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        result = subprocess.run([FFMPEG_BIN_PATH, "-encoders"], capture_output=True, text=True, check=False, **kwargs)
+        output = result.stdout.lower()
+        if "h264_nvenc" in output:
+            return "h264_nvenc", "Hardware Acceleration: NVIDIA GPU Detected"
+        elif "h264_amf" in output:
+            return "h264_amf", "Hardware Acceleration: AMD Radeon GPU Detected"
+        elif "h264_qsv" in output:
+            return "h264_qsv", "Hardware Acceleration: Intel QuickSync GPU Detected"
+        elif "h264_videotoolbox" in output:
+            return "h264_videotoolbox", "Hardware Acceleration: Apple Silicon Detected"
+        else:
+            return None, "Rendering on CPU (Software Encoding)"
+    except Exception:
+        return None, "FFmpeg not found. Rendering on CPU (Software Encoding)"
+
+
+AUDIO_EXTENSIONS = (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg")
+AUDIO_ROTATION_EPOCH = datetime(2024, 1, 1)  # fixed reference point, never change once in use
+
+AUDIO_ORDER_MANIFEST_NAME = "_track_order.json"
+
+def list_audio_tracks(audio_folder):
+    """
+    Return the list of audio filenames in audio_folder, in a STABLE rotation order.
+
+    Order is kept stable across runs via a small manifest file (_track_order.json)
+    saved inside the audio folder:
+      - Tracks already known keep their existing position (so past date->track
+        assignments never change just because you added a new song).
+      - Any brand-new files found in the folder are appended to the END of the
+        order (alphabetically among themselves), extending the rotation.
+      - Any files that were removed/renamed are dropped from the order.
+    If the manifest can't be read/written for some reason, falls back to a plain
+    alphabetical listing so the app still works.
+    """
+    if not audio_folder or not os.path.isdir(audio_folder):
+        return []
+
+    files_on_disk = sorted(f for f in os.listdir(audio_folder) if f.lower().endswith(AUDIO_EXTENSIONS))
+    manifest_path = os.path.join(audio_folder, AUDIO_ORDER_MANIFEST_NAME)
+
+    try:
+        known_order = []
+        if os.path.exists(manifest_path):
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                known_order = json.load(f)
+
+        on_disk_set = set(files_on_disk)
+        # Keep known tracks that still exist, in their original order
+        updated_order = [f for f in known_order if f in on_disk_set]
+        # Append newly discovered tracks (not seen before) at the end
+        known_set = set(updated_order)
+        new_files = sorted(f for f in files_on_disk if f not in known_set)
+        updated_order.extend(new_files)
+
+        if updated_order != known_order:
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(updated_order, f, indent=2)
+
+        return updated_order
+    except Exception:
+        return files_on_disk
+
+def pick_daily_audio(audio_folder, target_date, manual_filename=None):
+    """
+    Decide which audio file to use for target_date.
+    - If manual_filename is given (user picked a specific track), always use that one.
+    - Otherwise auto-rotate: same calendar date -> same track every time it's rendered,
+      the next calendar date -> the next track in the list, wrapping around once all
+      tracks have been used.
+    Returns the full path to the chosen audio file, or None if no audio files are found.
+    """
+    if not audio_folder:
+        return None
+        
+    if os.path.isfile(audio_folder):
+        return audio_folder
+        
+    tracks = list_audio_tracks(audio_folder)
+    if not tracks:
+        return None
+
+    if manual_filename and manual_filename in tracks:
+        return os.path.join(audio_folder, manual_filename)
+
+    days_since_epoch = (target_date.date() - AUDIO_ROTATION_EPOCH.date()).days
+    index = days_since_epoch % len(tracks)
+    return os.path.join(audio_folder, tracks[index])
+
+
+SETTINGS_ORG = "BhajanList"
+SETTINGS_APP = "VideoGenerator"
+
+def load_app_settings():
+    data = {"header_heights": {}}
+    try:
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        settings.beginGroup("header_heights")
+        for key in settings.childKeys():
+            value = settings.value(key)
+            try:
+                data["header_heights"][key] = int(float(value))
+            except Exception:
+                continue
+        settings.endGroup()
+    except Exception:
+        pass
+    return data
+
+def save_app_settings(settings_dict):
+    try:
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        settings.beginGroup("header_heights")
+        settings.remove("")
+        for key, value in settings_dict.get("header_heights", {}).items():
+            settings.setValue(key, int(value))
+        settings.endGroup()
+        settings.sync()
+        return True
+    except Exception:
+        return False
+
+# ==========================================
+# PART 1: YOUR ORIGINAL CORE LOGIC
+# ==========================================
+
+def create_temp_pdf_with_white_page(input_pdf_path, temp_pdf_path, log_callback=None):
+    try:
+        reader = PdfReader(input_pdf_path)
+        writer = PdfWriter()
+
+        for page in reader.pages:
+            writer.add_page(page)
+
+        if not reader.pages:
+            if log_callback: log_callback("Error: Input PDF has no pages.")
+            return False
+
+        last_page = reader.pages[-1]
+        width = float(last_page.mediabox.width)
+        height = float(last_page.mediabox.height)
+
+        packet = BytesIO()
+        c = canvas.Canvas(packet, pagesize=(width, height))
+        c.setFillColorRGB(1, 1, 1)
+        c.setStrokeColorRGB(1, 1, 1)
+        c.rect(0, 0, width, height, stroke=0, fill=1)
+        c.showPage()
+        c.save()
+        packet.seek(0)
+
+        blank_reader = PdfReader(packet)
+        writer.add_page(blank_reader.pages[0])
+
+        with open(temp_pdf_path, "wb") as f:
+            writer.write(f)
+
+        return True
+
+    except Exception as e:
+        if log_callback: log_callback(f"Error adding white page to PDF: {e}")
+        return False
+
+def crop_to_content_vertical_only(image_np):
+    gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
+    coords = cv2.findNonZero(thresh)
+    
+    if coords is None:
+        return image_np
+
+    y_min = int(np.min(coords[:, :, 1]))
+    y_max = int(np.max(coords[:, :, 1]))
+    
+    y_min = max(0, y_min)
+    y_max = min(image_np.shape[0], y_max + 1)
+    
+    return image_np[y_min:y_max, :]
+
+
+def calculate_overlap_between_images(img1_np, img2_np, dark_threshold=180, line_density_threshold=0.3, max_search=20):
+    """
+    Calculates how many pixels to overlap when stitching img2 below img1.
+    Looks at the bottom rows of img1 and top rows of img2 to find horizontal border lines.
+    """
+    h1, w1 = img1_np.shape[:2]
+    h2, w2 = img2_np.shape[:2]
+    
+    # Crop top/bottom regions
+    bottom_np = img1_np[max(0, h1 - max_search):h1, :]
+    bottom_gray = cv2.cvtColor(bottom_np, cv2.COLOR_BGR2GRAY)
+    
+    top_np = img2_np[0:min(h2, max_search), :]
+    top_gray = cv2.cvtColor(top_np, cv2.COLOR_BGR2GRAY)
+    
+    # Calculate density of dark pixels for each row in the search area
+    bottom_ratios = np.mean(bottom_gray < dark_threshold, axis=1)[::-1]
+    top_ratios = np.mean(top_gray < dark_threshold, axis=1)
+    
+    # Find thickness of border at bottom of img1
+    t1 = 0
+    for ratio in bottom_ratios:
+        if ratio >= line_density_threshold:
+            t1 += 1
+        else:
+            break
+            
+    # Find thickness of border at top of img2
+    t2 = 0
+    for ratio in top_ratios:
+        if ratio >= line_density_threshold:
+            t2 += 1
+        else:
+            break
+            
+    # If both pages have horizontal border lines, overlap them to merge the borders
+    if t1 > 0 and t2 > 0:
+        return max(t1, t2)
+        
+    return 0
+
+
+def pdf_to_stitched_image(pdf_path, target_width=1920, log_callback=None, is_cancelled_callback=None):
+    try:
+        doc = fitz.open(pdf_path)
+        if len(doc) == 0:
+            if log_callback: log_callback("No pages found in PDF.")
+            return None
+            
+        images_np = []
+        for i in range(len(doc)):
+            if is_cancelled_callback and is_cancelled_callback():
+                return None
+            
+            # Extract page as a high-quality pixmap (dpi=200 matches previous setup)
+            page = doc[i]
+            pix = page.get_pixmap(dpi=200)
+            
+            # Convert raw bytes to numpy array
+            img_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.h, pix.w, pix.n))
+            if pix.n == 4:
+                img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGBA2BGR)
+            elif pix.n == 3:
+                img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+            else:
+                img_bgr = cv2.cvtColor(img_np, cv2.COLOR_GRAY2BGR)
+                
+            images_np.append(img_bgr)
+            
+        if log_callback: log_callback(f"Successfully converted {len(images_np)} pages.")
+
+        cropped_images = []
+        for img in images_np:
+            if is_cancelled_callback and is_cancelled_callback():
+                return None
+            cropped_images.append(crop_to_content_vertical_only(img))
+        
+        # Resize to target width immediately to save memory using fast OpenCV
+        resized_images = []
+        for img in cropped_images:
+            if is_cancelled_callback and is_cancelled_callback():
+                return None
+            h, w = img.shape[:2]
+            if w != target_width:
+                aspect_ratio = h / w
+                new_height = int(target_width * aspect_ratio)
+                img = cv2.resize(img, (target_width, new_height), interpolation=cv2.INTER_AREA)
+            resized_images.append(img)
+
+        # Calculate overlaps between consecutive images to merge table borders
+        overlaps = []
+        for i in range(len(resized_images) - 1):
+            overlap = calculate_overlap_between_images(resized_images[i], resized_images[i+1])
+            overlaps.append(overlap)
+            if log_callback and overlap > 0:
+                log_callback(f"[i] Detected border line: overlapping pages {i+1} and {i+2} by {overlap}px to merge table borders.")
+
+        total_height = sum(img.shape[0] for img in resized_images) - sum(overlaps)
+        stitched_image = np.full((total_height, target_width, 3), 255, dtype=np.uint8)
+
+        current_y = 0
+        for i, img in enumerate(resized_images):
+            if i > 0:
+                current_y -= overlaps[i-1]
+            h = img.shape[0]
+            stitched_image[current_y:current_y+h, :] = img
+            current_y += h
+
+        # Clear memory
+        del cropped_images
+        del resized_images
+        del images_np
+        doc.close()
+        gc.collect()
+
+        return stitched_image
+
+    except Exception as e:
+        if log_callback: 
+            log_callback(f"[✗] Error converting PDF: {str(e)}")
+        return None
+
+
+def generate_and_write_frames_streaming(stitched_image, frame_queue, fps, video_output_view_height,
+                                        video_output_view_width, initial_static_duration_sec,
+                                        scroll_speed_pixels_per_second,
+                                        frozen_top_section_height_pixels,
+                                        white_strip_check_height=15,
+                                        white_strip_hold_duration_sec=0.2,
+                                        frame_progress_callback=None,
+                                        log_callback=None,
+                                        is_cancelled_callback=None):
+    if stitched_image is None:
+        return False, None
+
+    # stitched_image is already a BGR numpy array
+    full_img_bgr = stitched_image
+    stitched_height, stitched_width = full_img_bgr.shape[:2]
+    video_frame_width = min(video_output_view_width, stitched_width)
+    effective_video_view_height = min(video_output_view_height, stitched_height)
+
+    if effective_video_view_height <= 0 or video_frame_width <= 0:
+        return False, None
+
+    if frozen_top_section_height_pixels >= effective_video_view_height:
+        frozen_top_section_height_pixels = max(0, effective_video_view_height // 2)
+
+    scrolling_view_height = effective_video_view_height - frozen_top_section_height_pixels
+
+    # Pre-allocate frame buffers once and reuse them for all frames.
+    frame_buffer = np.full(
+        (video_output_view_height, video_output_view_width, 3),
+        255,
+        dtype=np.uint8
+    )
+    static_frame = frame_buffer.copy()
+    static_frame[0:effective_video_view_height, 0:video_frame_width] = full_img_bgr[
+        0:effective_video_view_height,
+        0:video_frame_width
+    ]
+
+    if frozen_top_section_height_pixels > 0:
+        frozen_header = full_img_bgr[
+            0:frozen_top_section_height_pixels,
+            0:video_frame_width
+        ]
+    else:
+        frozen_header = None
+
+    # Pre-calculate white-strip candidates by Y coordinate once.
+    # A strip is considered white if >=98% pixels are above threshold in all channels.
+    threshold = 245
+    strip_h = max(1, int(white_strip_check_height))
+    white_mask = np.all(full_img_bgr[:, 0:video_frame_width] >= threshold, axis=2)
+    row_white_ratio = np.mean(white_mask, axis=1)
+    row_prefix = np.concatenate(([0.0], np.cumsum(row_white_ratio)))
+    y_indices = np.arange(stitched_height)
+    y_end = np.minimum(y_indices + strip_h, stitched_height)
+    window_heights = np.maximum(1, y_end - y_indices)
+    strip_white_ratio = (row_prefix[y_end] - row_prefix[y_indices]) / window_heights
+    white_strip_by_y = strip_white_ratio >= 0.98
+
+    frame_count = 0
+    transition_detected = False
+    white_strip_streak = 0
+
+    # Phase 1: Initial static display.
+    initial_static_frames = max(0, int(fps * initial_static_duration_sec))
+    for _ in range(initial_static_frames):
+        if is_cancelled_callback and is_cancelled_callback():
+            return False, None
+        frame_queue.put(static_frame.copy())
+        frame_count += 1
+        if frame_progress_callback:
+            frame_progress_callback(1)
+
+    # Phase 2: Scrolling with white-strip hold detection.
+    if scrolling_view_height <= 0:
+        return False, None
+
+    scrollable_content_total_height = max(0, stitched_height - frozen_top_section_height_pixels)
+    max_scroll_offset_for_content = max(0, scrollable_content_total_height - scrolling_view_height)
+
+    if scroll_speed_pixels_per_second > 0:
+        total_scroll_duration_sec = scrollable_content_total_height / scroll_speed_pixels_per_second
+    else:
+        total_scroll_duration_sec = 1
+
+    total_scroll_frames = int(fps * total_scroll_duration_sec)
+    if total_scroll_frames == 0:
+        total_scroll_frames = 1
+
+    scroll_increment_per_frame = max_scroll_offset_for_content / total_scroll_frames if total_scroll_frames > 0 else 0
+
+    white_strip_hold_frames = max(1, int(fps * white_strip_hold_duration_sec))
+
+    if log_callback:
+        log_callback(f"Generating frames (optimized): {total_scroll_frames} scroll frames...")
+
+    for j in range(total_scroll_frames):
+        if is_cancelled_callback and is_cancelled_callback():
+            return False, None
+        current_content_scroll_offset = int(j * scroll_increment_per_frame)
+        if current_content_scroll_offset > max_scroll_offset_for_content:
+            current_content_scroll_offset = max_scroll_offset_for_content
+
+        frame_buffer[:] = 255
+
+        if frozen_header is not None:
+            frame_buffer[0:frozen_top_section_height_pixels, 0:video_frame_width] = frozen_header
+
+        scrolling_crop_top = frozen_top_section_height_pixels + current_content_scroll_offset
+        scrolling_crop_bottom = min(stitched_height, scrolling_crop_top + scrolling_view_height)
+
+        if scrolling_crop_top < stitched_height and scrolling_crop_bottom > scrolling_crop_top:
+            target_h = scrolling_crop_bottom - scrolling_crop_top
+            frame_buffer[
+                frozen_top_section_height_pixels:frozen_top_section_height_pixels + target_h,
+                0:video_frame_width
+            ] = full_img_bgr[scrolling_crop_top:scrolling_crop_bottom, 0:video_frame_width]
+
+        check_y_position = scrolling_crop_top
+        if 0 <= check_y_position < stitched_height and white_strip_by_y[check_y_position]:
+            white_strip_streak += 1
+            if white_strip_streak >= white_strip_hold_frames:
+                frame_queue.put(frame_buffer.copy())
+                frame_count += 1
+                if frame_progress_callback:
+                    frame_progress_callback(1)
+                transition_detected = True
+                if log_callback:
+                    log_callback(f"[✂] Transition point at frame {frame_count}")
+                break
+        else:
+            white_strip_streak = 0
+
+        frame_queue.put(frame_buffer.copy())
+        frame_count += 1
+        if frame_progress_callback:
+            frame_progress_callback(1)
+
+    return transition_detected, frame_buffer
+
+def add_static_image_to_video(frame_queue, image_path, duration_sec, fps, 
+                              video_width, video_height,
+                              frame_progress_callback=None,
+                              log_callback=None,
+                              last_frame=None,
+                              fade_duration_sec=0.0,
+                              is_cancelled_callback=None):
+    try:
+        if not os.path.exists(image_path):
+            if log_callback: log_callback(f"[✗] Error: Image not found at '{image_path}'. Skipping.")
+            return False
+        
+        # Load and resize image directly with OpenCV
+        image_cv2 = cv2.imread(image_path)
+        if image_cv2 is None:
+            if log_callback: log_callback(f"[✗] Error: Failed to load image '{image_path}'. Skipping.")
+            return False
+            
+        image_cv2 = cv2.resize(image_cv2, (video_width, video_height), interpolation=cv2.INTER_AREA)
+        
+        # Calculate number of frames
+        num_frames = int(fps * duration_sec)
+        fade_frames = int(fps * fade_duration_sec) if last_frame is not None else 0
+        fade_frames = min(fade_frames, num_frames)
+        
+        if log_callback:
+            if fade_frames > 0:
+                log_callback(f"--- Adding static image: '{os.path.basename(image_path)}' with {fade_duration_sec}s fade transition ---")
+            else:
+                log_callback(f"--- Adding static image: '{os.path.basename(image_path)}' ---")
+        
+        # Write fade transition frames
+        for i in range(fade_frames):
+            if is_cancelled_callback and is_cancelled_callback():
+                return False
+            alpha = i / max(1, fade_frames - 1)
+            # Linearly interpolate between last_frame and image_cv2
+            fade_frame = cv2.addWeighted(last_frame, 1.0 - alpha, image_cv2, alpha, 0)
+            frame_queue.put(fade_frame)
+            if frame_progress_callback:
+                frame_progress_callback(1)
+        
+        # Write remaining static frames
+        remaining_frames = num_frames - fade_frames
+        for _ in range(remaining_frames):
+            if is_cancelled_callback and is_cancelled_callback():
+                return False
+            frame_queue.put(image_cv2.copy())
+            if frame_progress_callback:
+                frame_progress_callback(1)
+        
+        if log_callback: log_callback(f"[✓] Static image added successfully")
+        return True
+        
+    except Exception as e:
+        if log_callback: log_callback(f"[✗] Error adding static image: {e}")
+        return False
+
+# ==========================================
+# PART 2: WORKER THREAD (Non-Freezing UI)
+# ==========================================
+
+class VideoWorker(QThread):
+    progress_signal = pyqtSignal(str)  # Emits text logs
+    progress_percent_signal = pyqtSignal(int)  # Emits progress percentage
+    progress_eta_signal = pyqtSignal(str)  # Emits ETA text
+    finished_signal = pyqtSignal(str)  # Emits success/fail message
+
+    def __init__(self, pdf_config_list, output_path, ending_img_path, ending_duration, fps=30, hardware_encoder=None, selected_date=None, audio_path=None):
+        super().__init__()
+        self.fps = fps
+        self.hardware_encoder = hardware_encoder
+        self.selected_date = selected_date
+        self.audio_path = audio_path
+        self.pdf_config_list = pdf_config_list
+        self.output_video_path = output_path
+        self.ending_image_path = ending_img_path
+        self.ending_image_duration = ending_duration
+        self.is_cancelled = False
+        self.total_estimated_frames = 1
+        self.frames_written = 0
+        self.start_time = None
+        self.last_progress_emit = 0.0
+
+    def estimate_frames_from_stitched_height(self, stitched_height, fps,
+                                             video_output_view_height,
+                                             initial_static_duration_sec,
+                                             scroll_speed_pixels_per_second,
+                                             frozen_top_section_height_pixels):
+        effective_video_view_height = min(video_output_view_height, stitched_height)
+        if effective_video_view_height <= 0:
+            return 1
+
+        if frozen_top_section_height_pixels >= effective_video_view_height:
+            frozen_top_section_height_pixels = max(0, effective_video_view_height // 2)
+
+        scrolling_view_height = max(0, effective_video_view_height - frozen_top_section_height_pixels)
+        initial_static_frames = max(0, int(fps * initial_static_duration_sec))
+
+        if scrolling_view_height <= 0 or scroll_speed_pixels_per_second <= 0 or fps <= 0:
+            return max(1, initial_static_frames)
+
+        scrollable_content_total_height = max(0, stitched_height - frozen_top_section_height_pixels)
+        max_scroll_offset_for_content = max(0, scrollable_content_total_height - scrolling_view_height)
+        scroll_increment_per_frame = scroll_speed_pixels_per_second / fps
+        scroll_frames = max(1, int(max_scroll_offset_for_content / scroll_increment_per_frame) + 1)
+
+        return max(1, initial_static_frames + scroll_frames)
+
+    def estimate_frames_from_page_count(self, pdf_path, fps, video_output_view_height,
+                                        initial_static_duration_sec,
+                                        scroll_speed_pixels_per_second,
+                                        frozen_top_section_height_pixels):
+        try:
+            page_count = len(PdfReader(pdf_path).pages) + 1  # +1 blank page added in temp PDF
+        except Exception:
+            page_count = 2
+
+        approx_resized_page_height = 2700
+        stitched_height_estimate = max(video_output_view_height, page_count * approx_resized_page_height)
+        return self.estimate_frames_from_stitched_height(
+            stitched_height_estimate,
+            fps,
+            video_output_view_height,
+            initial_static_duration_sec,
+            scroll_speed_pixels_per_second,
+            frozen_top_section_height_pixels
+        )
+
+    def _frames_written_callback(self, delta):
+        self.frames_written += delta
+        now = time.time()
+
+        if now - self.last_progress_emit < 0.2:
+            return
+
+        elapsed = max(0.001, now - self.start_time)
+        progress_ratio = min(1.0, self.frames_written / max(1, self.total_estimated_frames))
+        percent = int(progress_ratio * 100)
+        self.progress_percent_signal.emit(percent)
+
+        if self.frames_written > 0:
+            fps_effective = self.frames_written / elapsed
+            remaining_frames = max(0, self.total_estimated_frames - self.frames_written)
+            eta_sec = int(remaining_frames / max(0.001, fps_effective))
+        else:
+            eta_sec = 0
+
+        eta_m, eta_s = divmod(max(0, eta_sec), 60)
+        self.progress_eta_signal.emit(f"{eta_m:02d}:{eta_s:02d}")
+        self.last_progress_emit = now
+
+    def log(self, message):
+        self.progress_signal.emit(message)
+        print(message) 
+
+    def run(self):
+        try:
+            fps = self.fps
+            video_output_view_height = 1080
+            video_output_view_width = 1920
+            initial_static_duration_sec = 15.0
+            scroll_speed_pixels_per_second = 35
+            white_strip_check_height = 15
+            white_strip_hold_duration_sec = 0.7
+
+            ffmpeg_process = None
+
+            encoder = self.hardware_encoder if self.hardware_encoder else 'libx264'
+            
+            if self.hardware_encoder:
+                self.log(f"[i] Using Hardware Acceleration: {encoder}")
+            else:
+                self.log("[i] Using Software Rendering (CPU) via FFmpeg.")
+                
+            target_date = self.selected_date if getattr(self, 'selected_date', None) else datetime.now()
+            year_str = str(target_date.year)
+            
+            day_suffix = 'th' if 11 <= target_date.day <= 13 else {1: 'st', 2: 'nd', 3: 'rd'}.get(target_date.day % 10, 'th')
+            date_str = f"{target_date.day}{day_suffix} {target_date.strftime('%b %Y - %A')}"
+            
+            has_audio = bool(self.audio_path) and os.path.exists(self.audio_path)
+            if has_audio:
+                self.log(f"[i] Audio track: {os.path.basename(self.audio_path)}")
+            else:
+                self.log("[i] No audio track selected - rendering silent video.")
+
+            command = [
+                FFMPEG_BIN_PATH, '-y',
+                '-f', 'rawvideo', '-vcodec', 'rawvideo',
+                '-s', f'{video_output_view_width}x{video_output_view_height}',
+                '-pix_fmt', 'bgr24', '-r', str(fps),
+                '-i', '-',
+            ]
+
+            # Second input: the looping audio track (input index 1), only if one was picked.
+            if has_audio:
+                command.extend(['-stream_loop', '-1', '-i', self.audio_path])
+
+            command.extend([
+                '-c:v', encoder,
+                '-pix_fmt', 'yuv420p',
+                '-movflags', '+faststart',
+                '-metadata', 'title=Bhajan-List-Video',
+                '-metadata', 'description=Generated Auto-Scrolling Video',
+                '-metadata', 'comment=Made with Bhajan-List-Video-Generator.exe\nAvailable At https://github.com/SahajIVVIX-1/Video-Analyzer-Scroller',
+                '-metadata', f'artist={date_str}',
+                '-metadata', f'copyright=© {year_str} Chakhdi.local',
+                '-metadata', f'date={year_str}',
+                '-metadata', 'genre=Spiritual',
+                '-metadata', 'album=Bhajan Video Collection',
+            ])
+            
+            # Add specific hardware encoder settings
+            if encoder == 'h264_nvenc':
+                command.extend(['-preset', 'p6', '-tune', 'hq', '-b:v', '15M'])
+            elif encoder == 'h264_qsv':
+                command.extend(['-preset', 'veryfast', '-b:v', '15M'])
+            elif encoder == 'h264_amf':
+                command.extend(['-quality', 'speed', '-b:v', '15M'])
+            elif encoder == 'libx264':
+                command.extend(['-preset', 'veryfast', '-crf', '18', '-maxrate', '15M', '-bufsize', '30M'])
+
+            if has_audio:
+                # Map picked video stream (input 0) + audio stream (input 1), encode audio,
+                # and cut the (infinitely looping) audio exactly at video length via -shortest.
+                command.extend([
+                    '-map', '0:v:0', '-map', '1:a:0',
+                    '-c:a', 'aac', '-b:a', '192k',
+                    '-shortest',
+                ])
+
+            command.append(self.output_video_path)
+            
+            try:
+                kwargs = {}
+                if sys.platform == "win32":
+                    kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                log_file_path = os.path.join(os.path.dirname(self.output_video_path), "ffmpeg_error_log.txt")
+                self.ffmpeg_log_file = open(log_file_path, "w")
+                ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=self.ffmpeg_log_file, **kwargs)
+            except Exception as e:
+                self.log(f"⚠ FFmpeg Error: {e}. Cannot render video.")
+                self.finished_signal.emit(f"Error: FFmpeg failed to start - {e}")
+                return
+
+            frame_queue = queue.Queue(maxsize=100)
+            
+            def writer_thread():
+                while True:
+                    frame = frame_queue.get()
+                    if frame is None: # Sentinel value to stop
+                        frame_queue.task_done()
+                        break
+                    if ffmpeg_process:
+                        try:
+                            ffmpeg_process.stdin.write(frame.tobytes())
+                        except:
+                            pass
+                    frame_queue.task_done()
+                    
+            writer_thread_obj = threading.Thread(target=writer_thread)
+            writer_thread_obj.start()
+
+            def release_video():
+                if ffmpeg_process:
+                    try:
+                        ffmpeg_process.stdin.close()
+                        ffmpeg_process.wait()
+                    except Exception as e:
+                        self.log(f"⚠ Error closing FFmpeg: {e}")
+                    finally:
+                        if hasattr(self, 'ffmpeg_log_file') and not self.ffmpeg_log_file.closed:
+                            self.ffmpeg_log_file.close()
+                    
+
+            self.log(f"Creating merged video: '{self.output_video_path}'")
+            total_frames_written = 0
+            total_steps = len(self.pdf_config_list) + 1  # PDFs + ending image
+
+            # Initial estimate from input PDFs + ending image for smooth progress/ETA from start.
+            self.total_estimated_frames = 0
+            provisional_estimates = {}
+            for idx, config in enumerate(self.pdf_config_list):
+                input_pdf_path = config.get("pdf_path")
+                frozen_h = config.get("fixed_header_height_pixels", 300)
+                if input_pdf_path and os.path.exists(input_pdf_path):
+                    estimate = self.estimate_frames_from_page_count(
+                        input_pdf_path,
+                        fps,
+                        video_output_view_height,
+                        initial_static_duration_sec,
+                        scroll_speed_pixels_per_second,
+                        frozen_h
+                    )
+                else:
+                    estimate = int(fps * initial_static_duration_sec)
+                provisional_estimates[idx] = estimate
+                self.total_estimated_frames += estimate
+
+            ending_estimate = int(fps * self.ending_image_duration) if self.ending_image_path else 0
+            self.total_estimated_frames += ending_estimate
+            self.total_estimated_frames = max(1, self.total_estimated_frames)
+            self.frames_written = 0
+            self.start_time = time.time()
+            self.last_progress_emit = 0.0
+            self.progress_eta_signal.emit("calculating...")
+            last_frame = None
+
+            for idx, config in enumerate(self.pdf_config_list):
+                # Check if cancelled
+                if self.is_cancelled:
+                    self.log("⚠ Process cancelled by user")
+                    frame_queue.put(None)
+                    writer_thread_obj.join()
+                    video_writer.release()
+                    elapsed_sec = int(time.time() - self.start_time)
+                    self.finished_signal.emit(f"CANCELLED|{elapsed_sec}")
+                    return
+                
+                input_pdf_path = config.get("pdf_path")
+                fixed_header_height_pixels = config.get("fixed_header_height_pixels")
+
+                if not os.path.exists(input_pdf_path):
+                    self.log(f"[✗] Error: PDF not found at '{input_pdf_path}'. Skipping.")
+                    continue
+
+                base_name = os.path.splitext(os.path.basename(input_pdf_path))[0]
+                temp_pdf_path = f"temp_{base_name}.pdf"
+
+                self.log(f"--- Processing {idx + 1}/{len(self.pdf_config_list)}: '{os.path.basename(input_pdf_path)}' (Header: {fixed_header_height_pixels}px) ---")
+                
+                success = create_temp_pdf_with_white_page(input_pdf_path, temp_pdf_path, self.log)
+
+                if self.is_cancelled:
+                    self.log("⚠ Process cancelled by user")
+                    if os.path.exists(temp_pdf_path):
+                        try: os.remove(temp_pdf_path)
+                        except: pass
+                    frame_queue.put(None)
+                    writer_thread_obj.join()
+                    release_video()
+
+                    elapsed_sec = int(time.time() - self.start_time)
+                    self.finished_signal.emit(f"CANCELLED|{elapsed_sec}")
+                    return
+
+                if success:
+                    stitched_pdf_image = pdf_to_stitched_image(
+                        temp_pdf_path,
+                        target_width=video_output_view_width,
+                        log_callback=self.log,
+                        is_cancelled_callback=lambda: self.is_cancelled
+                    )
+
+                    if self.is_cancelled:
+                        self.log("⚠ Process cancelled by user")
+                        if os.path.exists(temp_pdf_path):
+                            try: os.remove(temp_pdf_path)
+                            except: pass
+                        frame_queue.put(None)
+                        writer_thread_obj.join()
+                        release_video()
+    
+                        elapsed_sec = int(time.time() - self.start_time)
+                        self.finished_signal.emit(f"CANCELLED|{elapsed_sec}")
+                        return
+
+                    if stitched_pdf_image is not None:
+                        # Refine estimate using actual stitched height for better ETA.
+                        refined_estimate = self.estimate_frames_from_stitched_height(
+                            stitched_pdf_image.shape[0],
+                            fps,
+                            video_output_view_height,
+                            initial_static_duration_sec,
+                            scroll_speed_pixels_per_second,
+                            fixed_header_height_pixels
+                        )
+                        provisional = provisional_estimates.get(idx, refined_estimate)
+                        self.total_estimated_frames = max(
+                            1,
+                            self.total_estimated_frames - provisional + refined_estimate
+                        )
+                        provisional_estimates[idx] = refined_estimate
+
+                        transition_detected, current_last_frame = generate_and_write_frames_streaming(
+                            stitched_pdf_image,
+                            frame_queue,
+                            fps=fps,
+                            video_output_view_height=video_output_view_height,
+                            video_output_view_width=video_output_view_width,
+                            initial_static_duration_sec=initial_static_duration_sec,
+                            scroll_speed_pixels_per_second=scroll_speed_pixels_per_second,
+                            frozen_top_section_height_pixels=fixed_header_height_pixels,
+                            white_strip_check_height=white_strip_check_height,
+                            white_strip_hold_duration_sec=white_strip_hold_duration_sec,
+                            frame_progress_callback=self._frames_written_callback,
+                            log_callback=self.log,
+                            is_cancelled_callback=lambda: self.is_cancelled
+                        )
+
+                        if self.is_cancelled:
+                            self.log("⚠ Process cancelled by user")
+                            if os.path.exists(temp_pdf_path):
+                                try: os.remove(temp_pdf_path)
+                                except: pass
+                            frame_queue.put(None)
+                            writer_thread_obj.join()
+                            release_video()
+        
+                            elapsed_sec = int(time.time() - self.start_time)
+                            self.finished_signal.emit(f"CANCELLED|{elapsed_sec}")
+                            return
+
+                        if current_last_frame is not None:
+                            last_frame = current_last_frame.copy()
+
+                        self.log(f"[✓] Completed '{os.path.basename(input_pdf_path)}'")
+                        
+                        del stitched_pdf_image
+                        gc.collect()
+                    else:
+                        self.log(f"[✗] Stitching failed for '{input_pdf_path}' (See error above)")
+
+                if os.path.exists(temp_pdf_path):
+                    try:
+                        os.remove(temp_pdf_path)
+                    except:
+                        pass
+
+            if self.ending_image_path:
+                if self.is_cancelled:
+                    self.log("[!] Process cancelled by user")
+                    frame_queue.put(None)
+                    writer_thread_obj.join()
+                    release_video()
+
+                    elapsed_sec = int(time.time() - self.start_time)
+                    self.finished_signal.emit(f"CANCELLED|{elapsed_sec}")
+                    return
+                    
+                add_static_image_to_video(frame_queue, self.ending_image_path, self.ending_image_duration, 
+                                          fps, video_output_view_width, video_output_view_height,
+                                          frame_progress_callback=self._frames_written_callback,
+                                          log_callback=self.log,
+                                          last_frame=last_frame,
+                                          fade_duration_sec=0.8,
+                                          is_cancelled_callback=lambda: self.is_cancelled)
+                
+                if self.is_cancelled:
+                    self.log("[!] Process cancelled by user")
+                    frame_queue.put(None)
+                    writer_thread_obj.join()
+                    release_video()
+
+                    elapsed_sec = int(time.time() - self.start_time)
+                    self.finished_signal.emit(f"CANCELLED|{elapsed_sec}")
+                    return
+
+                self.progress_percent_signal.emit(100)
+                self.progress_eta_signal.emit("00:00")
+
+            frame_queue.put(None)
+            writer_thread_obj.join()
+            release_video()
+            elapsed_sec = int(time.time() - self.start_time)
+            self.finished_signal.emit(f"SUCCESS|{elapsed_sec}")
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.finished_signal.emit(f"CRITICAL ERROR: {str(e)}")
+
+# ==========================================
+# PART 3: PDF PREVIEW DIALOG FOR HEADER SELECTION
+# ==========================================
+
+class DraggableBoundaryItem(QGraphicsRectItem):
+    """Custom boundary bar that shows exact video export cutting area"""
+    def __init__(self, x, y, width, height, parent_dialog):
+        super().__init__(x, y, width, height)
+        self.parent_dialog = parent_dialog
+        self.setFlag(QGraphicsRectItem.GraphicsItemFlag.ItemIsMovable, False)
+        self.setAcceptHoverEvents(True)
+        self.is_dragging = False
+        self.is_hovered = False
+        self.setCursor(QCursor(Qt.CursorShape.SizeVerCursor))
+        self.setToolTip("Drag up/down - This bar shows EXACT video export boundary")
+        self.update_visuals()
+        
+    def update_visuals(self):
+        if self.is_hovered or self.is_dragging:
+            # Transparent state with thicker outline glow when hovered or selected/dragging
+            brush = QBrush(QColor(124, 92, 255, 40))
+            pen = QPen(QColor(124, 92, 255, 240), 3)
+        else:
+            # Filled/opaque state when unhovered and not selected
+            brush = QBrush(QColor(124, 92, 255, 220))
+            pen = QPen(QColor(124, 92, 255, 255), 1)
+            
+        pen.setStyle(Qt.PenStyle.SolidLine)
+        pen.setCosmetic(True)
+        self.setBrush(brush)
+        self.setPen(pen)
+    
+    def hoverEnterEvent(self, event):
+        self.is_hovered = True
+        self.update_visuals()
+        super().hoverEnterEvent(event)
+    
+    def hoverLeaveEvent(self, event):
+        self.is_hovered = False
+        self.update_visuals()
+        super().hoverLeaveEvent(event)
+    
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.is_dragging = True
+            self.update_visuals()
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+            
+    def mouseMoveEvent(self, event):
+        if self.is_dragging:
+            new_y = event.scenePos().y()
+            
+            if self.parent_dialog.pdf_image:
+                new_y = max(10, min(new_y, self.parent_dialog.pdf_image.height - 10))
+            
+            boundary_height = 6  # Represents exact cutting precision
+            
+            if self.parent_dialog.pdf_image:
+                image_width = self.parent_dialog.pdf_image.width
+                self.setRect(0, new_y - boundary_height, image_width, boundary_height)
+                
+                if self.parent_dialog.header_rect:
+                    self.parent_dialog.header_rect.setRect(0, 0, image_width, new_y)
+            
+            self.parent_dialog.header_height = int(new_y)
+            self.parent_dialog.height_spinbox.blockSignals(True)
+            
+            if self.parent_dialog.current_unit == "mm":
+                mm_value = self.parent_dialog.px_to_mm(new_y)
+                self.parent_dialog.height_spinbox.setValue(mm_value)
+            else:
+                self.parent_dialog.height_spinbox.setValue(int(new_y))
+            
+            self.parent_dialog.height_spinbox.blockSignals(False)
+            self.parent_dialog.update_equiv_label()
+            
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+            
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.is_dragging = False
+            self.update_visuals()
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+class PDFPreviewDialog(QDialog):
+    def __init__(self, pdf_path, current_header_height=0, parent=None):
+        super().__init__(parent)
+        self.pdf_path = pdf_path
+        self.header_height = current_header_height if current_header_height else 300
+        self.pdf_image = None
+        self.boundary_item = None  # Exact cutting boundary bar
+        self.header_rect = None
+        self.zoom_level = 1.0
+        self.pixmap_item = None
+        self.dpi = 200  # Match PDF conversion DPI for accurate mm conversion
+        self.current_unit = "px"
+        
+        self.setWindowTitle(f"Header Height Selector - {os.path.basename(pdf_path)}")
+        self.setWindowIcon(QIcon(resource_path("icon.png")))
+        self.setMinimumSize(1100, 800)
+        
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #0f1117;
+                color: #ffffff;
+                font-family: 'Segoe UI', Inter, Poppins, Arial, sans-serif;
+            }
+            QLabel {
+                background-color: transparent;
+                color: #b8c0cc;
+                font-size: 13px;
+            }
+            QDoubleSpinBox {
+                background-color: #1e232d;
+                border: 1px solid #2f3746;
+                border-radius: 8px;
+                padding: 6px 12px;
+                color: #ffffff;
+                font-size: 13px;
+                font-weight: 500;
+            }
+            QDoubleSpinBox:focus {
+                border: 1px solid #7c5cff;
+                background-color: #252b36;
+            }
+            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+                border: none;
+                background: transparent;
+                width: 20px;
+            }
+            QDoubleSpinBox::up-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-bottom: 5px solid #b8c0cc;
+            }
+            QDoubleSpinBox::up-arrow:hover {
+                border-bottom-color: #7c5cff;
+            }
+            QDoubleSpinBox::down-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 5px solid #b8c0cc;
+            }
+            QDoubleSpinBox::down-arrow:hover {
+                border-top-color: #7c5cff;
+            }
+            QComboBox {
+                background-color: #1e232d;
+                border: 1px solid #2f3746;
+                border-radius: 8px;
+                padding: 6px 12px;
+                color: #ffffff;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            QComboBox:focus {
+                border: 1px solid #7c5cff;
+                background-color: #252b36;
+            }
+            QComboBox::drop-down {
+                border: none;
+                background-color: transparent;
+                width: 24px;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 5px solid #b8c0cc;
+                margin-right: 4px;
+            }
+            QComboBox::down-arrow:hover {
+                border-top-color: #7c5cff;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #1e232d;
+                color: #ffffff;
+                selection-background-color: #7c5cff;
+                selection-color: #ffffff;
+                border: 1px solid #2f3746;
+                border-radius: 8px;
+                outline: 0px;
+            }
+            QPushButton {
+                background-color: #1e232d;
+                color: #b8c0cc;
+                border: 1px solid #2f3746;
+                border-radius: 8px;
+                padding: 8px 16px;
+                font-weight: 600;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #252b36;
+                color: #ffffff;
+                border: 1px solid #7c5cff;
+            }
+            QPushButton:pressed {
+                background-color: #161a22;
+            }
+            QGraphicsView {
+                background-color: #161a22;
+                border: 1px solid #2f3746;
+                border-radius: 12px;
+            }
+            QScrollBar:vertical {
+                border: none;
+                background: #0f1117;
+                width: 8px;
+                margin: 0px;
+            }
+            QScrollBar::handle:vertical {
+                background: #2f3746;
+                min-height: 20px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #7c5cff;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                border: none;
+                background: none;
+                height: 0px;
+            }
+            QScrollBar:horizontal {
+                border: none;
+                background: #0f1117;
+                height: 8px;
+                margin: 0px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #2f3746;
+                min-width: 20px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: #7c5cff;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                border: none;
+                background: none;
+                width: 0px;
+            }
+        """)
+        
+        layout = QVBoxLayout()
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
+        self.setLayout(layout)
+        
+        # Title bar
+        title_bar = QLabel("PDF Header Height Selector")
+        title_bar.setStyleSheet("""
+            font-size: 20px;
+            font-weight: 800;
+            color: #7c5cff;
+            padding: 4px;
+            margin-bottom: 2px;
+        """)
+        layout.addWidget(title_bar)
+        
+        # Info label
+        info_label = QLabel("ℹ  The transparent purple area shows the frozen header. The blue boundary line shows the exact cutting location. Drag the line directly to adjust.")
+        info_label.setStyleSheet("""
+            font-size: 13px;
+            color: #b8c0cc;
+            background-color: #161a22;
+            padding: 12px 16px;
+            border-radius: 10px;
+            border: 1px solid #2f3746;
+            border-left: 4px solid #7c5cff;
+        """)
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+        
+        # Graphics view for PDF preview
+        self.scene = QGraphicsScene()
+        self.view = QGraphicsView(self.scene)
+        self.view.setRenderHint(self.view.renderHints())
+        self.view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.view.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.view.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)  # Smooth updates
+        self.view.setOptimizationFlags(QGraphicsView.OptimizationFlag.DontAdjustForAntialiasing)
+        layout.addWidget(self.view)
+        
+        self.view.wheelEvent = self.wheel_zoom
+        
+        # Control Dock
+        control_dock = QFrame()
+        control_dock.setObjectName("control_dock")
+        control_dock.setStyleSheet("""
+            #control_dock {
+                background-color: #161a22;
+                border: 1px solid #2f3746;
+                border-radius: 12px;
+            }
+        """)
+        control_layout = QHBoxLayout(control_dock)
+        control_layout.setSpacing(12)
+        control_layout.setContentsMargins(15, 12, 15, 12)
+        
+        zoom_group = QWidget()
+        zoom_group.setStyleSheet("""
+            QWidget {
+                background-color: #1e232d;
+                border: 1px solid #2f3746;
+                border-radius: 8px;
+            }
+            QLabel {
+                border: none;
+                background: transparent;
+            }
+        """)
+        zoom_layout = QHBoxLayout()
+        zoom_layout.setSpacing(8)
+        zoom_layout.setContentsMargins(8, 5, 8, 5)
+        zoom_group.setLayout(zoom_layout)
+        
+        zoom_label = QLabel("Zoom:")
+        zoom_label.setStyleSheet("background: transparent; color: #b4bac7; font-size: 12px;")
+        zoom_layout.addWidget(zoom_label)
+        
+        zoom_out_btn = QPushButton("−")
+        zoom_out_btn.setFixedSize(35, 35)
+        zoom_out_btn.setToolTip("Zoom Out (Ctrl+-)")
+        zoom_out_btn.setShortcut("Ctrl+-")
+        zoom_out_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 16px;
+                font-weight: bold;
+                background-color: #161a22;
+                border: 1px solid #2f3746;
+                border-radius: 6px;
+                color: #b8c0cc;
+                padding: 0px;
+            }
+            QPushButton:hover {
+                background-color: #7c5cff;
+                color: #ffffff;
+                border-color: #7c5cff;
+            }
+            QPushButton:pressed {
+                background-color: #9277ff;
+            }
+        """)
+        zoom_out_btn.clicked.connect(self.zoom_out)
+        zoom_layout.addWidget(zoom_out_btn)
+        
+        self.zoom_label = QLabel("100%")
+        self.zoom_label.setFixedWidth(55)
+        self.zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.zoom_label.setStyleSheet("background: transparent; color: #7c5cff; font-weight: bold; font-size: 13px;")
+        zoom_layout.addWidget(self.zoom_label)
+        
+        zoom_in_btn = QPushButton("+")
+        zoom_in_btn.setFixedSize(35, 35)
+        zoom_in_btn.setToolTip("Zoom In (Ctrl++)")
+        zoom_in_btn.setShortcut("Ctrl++")
+        zoom_in_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 16px;
+                font-weight: bold;
+                background-color: #161a22;
+                border: 1px solid #2f3746;
+                border-radius: 6px;
+                color: #b8c0cc;
+                padding: 0px;
+            }
+            QPushButton:hover {
+                background-color: #7c5cff;
+                color: #ffffff;
+                border-color: #7c5cff;
+            }
+            QPushButton:pressed {
+                background-color: #9277ff;
+            }
+        """)
+        zoom_in_btn.clicked.connect(self.zoom_in)
+        zoom_layout.addWidget(zoom_in_btn)
+        
+        fit_btn = QPushButton("Fit")
+        fit_btn.setFixedSize(45, 35)
+        fit_btn.setToolTip("Fit to View (Ctrl+0)")
+        fit_btn.setShortcut("Ctrl+0")
+        fit_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #161a22;
+                font-size: 12px;
+                font-weight: bold;
+                border: 1px solid #2f3746;
+                border-radius: 6px;
+                color: #b8c0cc;
+            }
+            QPushButton:hover {
+                background-color: #7c5cff;
+                color: #ffffff;
+                border-color: #7c5cff;
+            }
+            QPushButton:pressed {
+                background-color: #9277ff;
+            }
+        """)
+        fit_btn.clicked.connect(self.fit_to_view)
+        zoom_layout.addWidget(fit_btn)
+        
+        control_layout.addWidget(zoom_group)
+        control_layout.addStretch()
+        
+        # Header height controls
+        height_label = QLabel("Header Height:")
+        height_label.setStyleSheet("color: #b8c0cc; font-weight: 600;")
+        control_layout.addWidget(height_label)
+        
+        self.height_spinbox = QDoubleSpinBox()
+        self.height_spinbox.setMinimum(0)
+        self.height_spinbox.setMaximum(2000)
+        self.height_spinbox.setValue(self.header_height)
+        self.height_spinbox.setSingleStep(1)
+        self.height_spinbox.setDecimals(0)  # Start with 0 decimals for px
+        self.height_spinbox.setFixedWidth(100)
+        self.height_spinbox.valueChanged.connect(self.update_line_position)
+        control_layout.addWidget(self.height_spinbox)
+        
+        self.unit_combo = QComboBox()
+        self.unit_combo.addItems(["px", "mm"])
+        self.unit_combo.setFixedWidth(60)
+        self.unit_combo.setToolTip("Switch between pixels and millimeters")
+        self.unit_combo.currentTextChanged.connect(self.change_unit)
+        control_layout.addWidget(self.unit_combo)
+        
+        self.equiv_label = QLabel("")
+        self.equiv_label.setStyleSheet("color: #7c5cff; font-size: 13px; font-weight: 700; font-style: italic;")
+        self.equiv_label.setFixedWidth(100)
+        control_layout.addWidget(self.equiv_label)
+        
+        control_layout.addStretch()
+        
+        ok_btn = QPushButton("✔  Confirm")
+        ok_btn.setStyleSheet("""
+            QPushButton {
+                background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #22c55e, stop:1 #16a34a);
+                color: #ffffff;
+                border-radius: 8px;
+                padding: 10px 24px;
+                font-size: 13px;
+                font-weight: bold;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #25d366, stop:1 #1db854);
+            }
+            QPushButton:pressed {
+                background-color: #14532d;
+            }
+        """)
+        ok_btn.clicked.connect(self.accept)
+        control_layout.addWidget(ok_btn)
+        
+        cancel_btn = QPushButton("✕  Cancel")
+        cancel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #271c1e;
+                border: 1px solid #5a2027;
+                color: #ef4444;
+                border-radius: 8px;
+                padding: 10px 24px;
+                font-size: 13px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #ef4444;
+                color: #ffffff;
+                border-color: #ef4444;
+            }
+            QPushButton:pressed {
+                background-color: #7f1d1d;
+            }
+        """)
+        cancel_btn.clicked.connect(self.reject)
+        control_layout.addWidget(cancel_btn)
+        
+        layout.addWidget(control_dock)
+        self.load_pdf_preview()
+    
+
+    def load_pdf_preview(self):
+        try:
+            doc = fitz.open(self.pdf_path)
+            if len(doc) == 0:
+                QMessageBox.warning(self, "Error", "No pages found in PDF.")
+                self.reject()
+                return
+            
+            page = doc[0]
+            pix = page.get_pixmap(dpi=200)
+            
+            img_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.h, pix.w, pix.n))
+            if pix.n == 4:
+                img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGBA2BGR)
+            elif pix.n == 3:
+                img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+            else:
+                img_bgr = cv2.cvtColor(img_np, cv2.COLOR_GRAY2BGR)
+            
+            cropped_image = crop_to_content_vertical_only(img_bgr)
+            
+            target_width = 1920
+            h, w = cropped_image.shape[:2]
+            if w != target_width:
+                aspect_ratio = h / w
+                new_height = int(target_width * aspect_ratio)
+                cropped_image = cv2.resize(cropped_image, (target_width, new_height), interpolation=cv2.INTER_AREA)
+                
+            # Create a dummy object to maintain compatibility with width/height attributes used elsewhere
+            class DummyImg:
+                def __init__(self, width, height):
+                    self.width = width
+                    self.height = height
+                    
+            self.pdf_image = DummyImg(cropped_image.shape[1], cropped_image.shape[0])
+                
+            success, encoded_img = cv2.imencode('.png', cropped_image)
+            if not success:
+                QMessageBox.warning(self, "Error", "Could not encode PDF preview.")
+                self.reject()
+                return
+            
+            pixmap = QPixmap()
+            pixmap.loadFromData(encoded_img.tobytes())
+            
+            pixmap_item = QGraphicsPixmapItem(pixmap)
+            self.scene.addItem(pixmap_item)
+            self.pixmap_item = pixmap_item  # Store reference
+            
+            self.height_spinbox.setMaximum(self.pdf_image.height)
+            
+            # Create semi-transparent rectangle for header area
+            self.header_rect = QGraphicsRectItem(0, 0, self.pdf_image.width, self.header_height)
+            brush = QBrush(QColor(124, 92, 255, 30))  # Light purple transparency matching primary accent
+            self.header_rect.setBrush(brush)
+            self.header_rect.setPen(QPen(Qt.PenStyle.NoPen))
+            self.header_rect.setZValue(50)
+            self.scene.addItem(self.header_rect)
+            
+            # Create exact cutting boundary bar (matches video export precision)
+            boundary_height = 6  # Exact cutting precision thickness
+            self.boundary_item = DraggableBoundaryItem(
+                0, 
+                self.header_height - boundary_height, 
+                self.pdf_image.width, 
+                boundary_height, 
+                self
+            )
+            self.boundary_item.setZValue(100)
+            self.scene.addItem(self.boundary_item)
+            
+            # Fit in view initially
+            self.fit_to_view()
+            
+            # Initialize equivalent label
+            self.update_equiv_label()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load PDF:\n{str(e)}")
+            self.reject()
+    
+    def update_line_position(self, value):
+        """Update the line position when spinbox value changes"""
+        # Convert value to pixels if in mm
+        if self.current_unit == "mm":
+            value_px = self.mm_to_px(value)
+        else:
+            value_px = value
+        
+        self.header_height = int(value_px)
+        
+        if self.boundary_item and self.pdf_image:
+            # Update boundary bar position to show exact cutting area
+            boundary_height = 6  # Exact cutting precision thickness
+            self.boundary_item.setRect(
+                0, 
+                value_px - boundary_height, 
+                self.pdf_image.width, 
+                boundary_height
+            )
+            
+            # Update header rectangle
+            if self.header_rect:
+                self.header_rect.setRect(0, 0, self.pdf_image.width, value_px)
+        
+        # Update equivalent label
+        self.update_equiv_label()
+    
+    def zoom_in(self):
+        """Zoom in by 20%"""
+        self.zoom_level *= 1.2
+        self.zoom_level = min(self.zoom_level, 5.0)  # Max 500%
+        self.apply_zoom()
+    
+    def zoom_out(self):
+        """Zoom out by 20%"""
+        self.zoom_level /= 1.2
+        self.zoom_level = max(self.zoom_level, 0.1)  # Min 10%
+        self.apply_zoom()
+    
+    def fit_to_view(self):
+        """Fit the image to view"""
+        if self.pixmap_item:
+            self.view.fitInView(self.pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
+            # Get the current transform to determine zoom level
+            transform = self.view.transform()
+            self.zoom_level = transform.m11()  # Get scale factor
+            self.update_zoom_label()
+    
+    def apply_zoom(self):
+        """Apply current zoom level to view"""
+        if self.pixmap_item:
+            # Reset transform and apply new zoom
+            self.view.resetTransform()
+            self.view.scale(self.zoom_level, self.zoom_level)
+            self.update_zoom_label()
+    
+    def update_zoom_label(self):
+        """Update zoom percentage label"""
+        percentage = int(self.zoom_level * 100)
+        self.zoom_label.setText(f"{percentage}%")
+    
+    def px_to_mm(self, pixels):
+        """Convert pixels to millimeters based on DPI"""
+        inches = pixels / self.dpi
+        mm = inches * 25.4
+        return mm
+    
+    def mm_to_px(self, mm):
+        """Convert millimeters to pixels based on DPI"""
+        inches = mm / 25.4
+        pixels = inches * self.dpi
+        return pixels
+    
+    def change_unit(self, unit):
+        """Change measurement unit between px and mm"""
+        if unit == self.current_unit:
+            return
+        
+        current_value = self.height_spinbox.value()
+        
+        if unit == "mm":
+            # Converting from px to mm
+            new_value = self.px_to_mm(current_value)
+            self.height_spinbox.setDecimals(2)
+            self.height_spinbox.setSingleStep(0.5)
+            self.height_spinbox.blockSignals(True)
+            self.height_spinbox.setMaximum(self.px_to_mm(self.pdf_image.height) if self.pdf_image else 1000)
+            self.height_spinbox.setValue(new_value)
+            self.height_spinbox.blockSignals(False)
+        else:
+            # Converting from mm to px
+            new_value = self.mm_to_px(current_value)
+            self.height_spinbox.setDecimals(0)
+            self.height_spinbox.setSingleStep(1)
+            self.height_spinbox.blockSignals(True)
+            self.height_spinbox.setMaximum(self.pdf_image.height if self.pdf_image else 2000)
+            self.height_spinbox.setValue(new_value)
+            self.height_spinbox.blockSignals(False)
+        
+        self.current_unit = unit
+        self.update_equiv_label()
+    
+    def update_equiv_label(self):
+        """Update the equivalent value label"""
+        if self.current_unit == "mm":
+            # Show px equivalent
+            px_value = int(self.header_height)
+            self.equiv_label.setText(f"({px_value} px)")
+        else:
+            # Show mm equivalent
+            mm_value = self.px_to_mm(self.header_height)
+            self.equiv_label.setText(f"({mm_value:.2f} mm)")
+    
+    def wheel_zoom(self, event):
+        """Handle mouse wheel zoom"""
+        if event.angleDelta().y() > 0:
+            # Scroll up - zoom in
+            factor = 1.15
+            self.zoom_level *= factor
+            self.zoom_level = min(self.zoom_level, 5.0)
+        else:
+            # Scroll down - zoom out
+            factor = 1 / 1.15
+            self.zoom_level *= factor
+            self.zoom_level = max(self.zoom_level, 0.1)
+        
+        self.view.scale(factor, factor)
+        self.update_zoom_label()
+    
+    def get_header_height(self):
+        return self.header_height
+
+# ==========================================
+# PART 4: PyQt6 MAIN WINDOW UI CLASS
+# ==========================================
+
+class MainWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("MainWindow")
+        self.setWindowTitle("Bhajan List Video Generator")
+        self.setWindowIcon(QIcon(resource_path("icon.png")))
+        self.setMinimumWidth(700)
+        self.setMinimumHeight(870)
+        
+        # Setup Ctrl+Q shortcut
+        self.exit_shortcut = QShortcut(QKeySequence("Ctrl+Q"), self)
+        self.exit_shortcut.activated.connect(self.handle_exit)
+        
+        # Setup Ctrl+W shortcut for CLEAR
+        self.clear_shortcut = QShortcut(QKeySequence("Ctrl+W"), self)
+        self.clear_shortcut.activated.connect(self.clear_ui)
+        
+        # Setup Ctrl+E shortcut to open a new instance
+        self.new_instance_shortcut = QShortcut(QKeySequence("Ctrl+E"), self)
+        self.new_instance_shortcut.activated.connect(self.open_new_instance)
+        
+        # Ctrl+R shortcut removed
+        
+        # Apply Custom Theme based on provided palette
+        self.setStyleSheet("""
+            QWidget#MainWindow {
+                background: #0B1220;
+            }
+            QWidget {
+                color: #F8FAFC;
+                font-family: 'Segoe UI', Inter, Arial, sans-serif;
+                font-size: 13px;
+            }
+            QLabel {
+                background-color: transparent;
+                color: #94A3B8;
+                font-weight: 500;
+            }
+            QLineEdit {
+                background-color: #1F2937;
+                border: 1px solid #334155;
+                border-radius: 8px;
+                padding: 6px 12px;
+                color: #F8FAFC;
+            }
+            QLineEdit:focus {
+                border: 1px solid #10B981;
+                background-color: #1F2937;
+            }
+            QComboBox {
+                background-color: #1F2937;
+                border: 1px solid #334155;
+                border-radius: 8px;
+                padding: 6px 12px;
+                color: #F8FAFC;
+            }
+            QComboBox:focus {
+                border: 1px solid #10B981;
+                background-color: #1F2937;
+            }
+            QComboBox::drop-down {
+                border: none;
+                background-color: transparent;
+                width: 24px;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 5px solid #94A3B8;
+                margin-right: 4px;
+            }
+            QComboBox::down-arrow:hover {
+                border-top-color: #10B981;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #1F2937;
+                color: #F8FAFC;
+                selection-background-color: #10B981;
+                selection-color: #F8FAFC;
+                border: 1px solid #334155;
+                border-radius: 8px;
+                outline: 0px;
+            }
+            QComboBox QAbstractItemView::item {
+                padding: 10px 12px;
+                min-height: 20px;
+            }
+            QPushButton {
+                background-color: #374151;
+                color: #F8FAFC;
+                border: 1px solid #334155;
+                border-radius: 8px;
+                padding: 7px 15px;
+                font-weight: 600;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #4B5563;
+                border: 1px solid #10B981;
+            }
+            QPushButton:pressed {
+                background-color: #1F2937;
+            }
+            QPushButton:disabled {
+                background-color: #111827;
+                color: #94A3B8;
+                border: 1px solid #334155;
+            }
+            QDateEdit {
+                background-color: #1F2937;
+                border: 1px solid #334155;
+                padding: 6px 12px;
+                border-radius: 8px;
+                color: #F8FAFC;
+            }
+            QDateEdit:focus {
+                border: 1px solid #10B981;
+                background-color: #1F2937;
+            }
+            QDateEdit::drop-down {
+                border: none;
+                background-color: #10B981;
+                border-top-right-radius: 7px;
+                border-bottom-right-radius: 7px;
+                width: 24px;
+            }
+            QDateEdit::down-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 6px solid #F8FAFC;
+                margin-right: 5px;
+            }
+            QTextEdit {
+                background-color: #1F2937;
+                border: 1px solid #334155;
+                font-family: 'Consolas', 'Courier New', monospace;
+                font-size: 12px;
+                color: #94A3B8;
+                border-radius: 12px;
+                padding: 10px;
+            }
+            QProgressBar {
+                border: 1px solid #334155;
+                border-radius: 8px;
+                text-align: center;
+                background-color: #1F2937;
+                height: 20px;
+                color: #F8FAFC;
+                font-weight: bold;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #10B981, stop:1 #059669);
+                border-radius: 7px;
+            }
+            
+            /* QCalendarWidget Custom Styles */
+            QCalendarWidget {
+                background-color: #0B1220;
+                border: 1px solid #334155;
+                border-radius: 10px;
+            }
+            QCalendarWidget QWidget#qt_calendar_navigationbar {
+                background-color: #111827;
+                border-bottom: 1px solid #334155;
+                border-top-left-radius: 10px;
+                border-top-right-radius: 10px;
+            }
+            QCalendarWidget QToolButton {
+                color: #F8FAFC;
+                font-weight: bold;
+                background-color: transparent;
+                border: none;
+                border-radius: 6px;
+                margin: 4px;
+                padding: 4px 8px;
+            }
+            QCalendarWidget QToolButton:hover {
+                background-color: #374151;
+            }
+            QCalendarWidget QToolButton:pressed {
+                background-color: #1F2937;
+            }
+            QCalendarWidget QToolButton#qt_calendar_prevmonth {
+                qproperty-icon: none;
+                font-size: 11px;
+                qproperty-text: "◀";
+                color: #94A3B8;
+            }
+            QCalendarWidget QToolButton#qt_calendar_nextmonth {
+                qproperty-icon: none;
+                font-size: 11px;
+                qproperty-text: "▶";
+                color: #94A3B8;
+            }
+            QCalendarWidget QToolButton#qt_calendar_prevmonth:hover,
+            QCalendarWidget QToolButton#qt_calendar_nextmonth:hover {
+                color: #F8FAFC;
+                background-color: #374151;
+            }
+            QCalendarWidget QMenu {
+                background-color: #111827;
+                color: #F8FAFC;
+                border: 1px solid #334155;
+                border-radius: 8px;
+                padding: 4px;
+            }
+            QCalendarWidget QMenu::item {
+                padding: 4px 16px;
+                border-radius: 6px;
+            }
+            QCalendarWidget QMenu::item:selected {
+                background-color: #10B981;
+                color: #F8FAFC;
+            }
+            QCalendarWidget QSpinBox {
+                background-color: #1F2937;
+                color: #F8FAFC;
+                border: 1px solid #334155;
+                border-radius: 6px;
+                padding: 2px;
+                margin-right: 4px;
+            }
+            QCalendarWidget QSpinBox::up-button,
+            QCalendarWidget QSpinBox::down-button {
+                border: none;
+                background-color: transparent;
+            }
+            QCalendarWidget QTableView {
+                background-color: #0B1220;
+                border: none;
+                selection-background-color: #10B981;
+                selection-color: #F8FAFC;
+                outline: 0;
+            }
+            QCalendarWidget QHeaderView::section {
+                background-color: #0B1220;
+                color: #94A3B8;
+                border: none;
+                padding: 4px;
+                font-weight: 600;
+                font-size: 11px;
+            }
+            QCalendarWidget QAbstractItemView:enabled {
+                color: #F8FAFC;
+                selection-background-color: #10B981;
+                selection-color: #F8FAFC;
+            }
+            QCalendarWidget QAbstractItemView:disabled {
+                color: #334155;
+            }
+        """)
+
+        # Main Layout
+        layout = QVBoxLayout()
+        layout.setSpacing(10)
+        layout.setContentsMargins(12, 12, 12, 12)
+        self.setLayout(layout)
+
+        # Title
+        title = QLabel("Bhajan List Video Generator")
+        title.setStyleSheet("font-size: 32px; color: #ffffff; margin-bottom: 2px; font-weight: 800; background: transparent;")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+
+        # --- GPU Hardware Acceleration Detection ---
+        self.detected_hardware_encoder, gpu_status_text = detect_ffmpeg_gpu_encoder()
+        self.hardware_encoder = self.detected_hardware_encoder
+        self.gpu_status_text_original = gpu_status_text
+        
+        gpu_container = QHBoxLayout()
+        gpu_container.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        self.gpu_status_lbl = QLabel(gpu_status_text)
+        self.gpu_status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        if self.hardware_encoder:
+            self.gpu_status_lbl.setStyleSheet("color: #10B981; font-weight: bold; font-size: 13px; margin-bottom: 8px; background: transparent;") # Green
+        else:
+            self.gpu_status_lbl.setStyleSheet("color: #64748b; font-weight: bold; font-size: 13px; margin-bottom: 8px; background: transparent;") # Gray
+            
+        gpu_container.addWidget(self.gpu_status_lbl)
+        
+        if self.detected_hardware_encoder:
+            self.gpu_switch_btn = QPushButton("Switch to CPU")
+            self.gpu_switch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.gpu_switch_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #334155;
+                    color: white;
+                    border: none;
+                    border-radius: 4px;
+                    padding: 2px 8px;
+                    font-size: 11px;
+                    margin-left: 10px;
+                    margin-bottom: 8px;
+                }
+                QPushButton:hover {
+                    background-color: #475569;
+                }
+            """)
+            self.gpu_switch_btn.clicked.connect(self.toggle_gpu_mode)
+            gpu_container.addWidget(self.gpu_switch_btn)
+            
+        layout.addLayout(gpu_container)
+
+        # --- Form Container ---
+        form_widget = QWidget()
+        form_widget.setObjectName("FormCard")
+        form_widget.setStyleSheet("""
+            QWidget#FormCard {
+                background-color: #111827;
+                border: 1px solid #334155;
+                border-radius: 16px;
+            }
+        """)
+        form_layout = QVBoxLayout()
+        form_layout.setSpacing(10)
+        form_layout.setContentsMargins(20, 20, 20, 20)
+        form_widget.setLayout(form_layout)
+        layout.addWidget(form_widget)
+
+
+
+        # 1. Date Selection
+        date_box = QHBoxLayout()
+        date_box.setSpacing(5)
+        date_label = QLabel("Select Date:")
+        date_label.setStyleSheet("color: white; font-weight: bold; font-size: 14px;")
+        date_label.setFixedWidth(185)
+        self.date_input = QDateEdit()
+        self.date_input.setDate(QDate.currentDate())
+        self.date_input.setCalendarPopup(True)
+        self.date_input.setDisplayFormat("dd-MM-yyyy")
+        date_box.addWidget(date_label)
+        date_box.addWidget(self.date_input)
+        
+        # Customize QCalendarWidget for weekends and structure
+        calendar = self.date_input.calendarWidget()
+        if calendar:
+            calendar.setGridVisible(False)
+            from PyQt6.QtGui import QTextCharFormat, QColor, QBrush
+            fmt_weekend = QTextCharFormat()
+            fmt_weekend.setForeground(QBrush(QColor("#b4bac7")))  # Subtle text secondary for weekends
+            calendar.setWeekdayTextFormat(Qt.DayOfWeek.Saturday, fmt_weekend)
+            calendar.setWeekdayTextFormat(Qt.DayOfWeek.Sunday, fmt_weekend)
+            
+        form_layout.addLayout(date_box)
+
+        # 2. File Inputs (Dictionary to store widgets and header heights)
+        self.file_inputs = {}
+        self.file_toggles = {}
+        self.header_heights = {}  # Store dynamic header heights
+        self.current_eta_text = "--:--"
+        self.app_settings = load_app_settings()
+        
+        # Define the exact requirements
+        self.requirements = [
+            ("Pradaxina PDF", "pdf", 334),  # Label, type, default_header_height
+            ("Dandvat PDF", "pdf", 372),
+            ("Dhun PDF", "pdf", 325),
+            ("Kirtan PDF", "pdf", 311),
+            ("Jay Swa. Photo", "img", None) # No header for image
+        ]
+
+        for label_text, type_key, default_header_h in self.requirements:
+            row = QHBoxLayout()
+            row.setSpacing(5)
+            
+            toggle = ModernToggleSwitch()
+            toggle.setChecked(True)
+            toggle.setToolTip(f"Include {label_text} in rendering")
+            row.addWidget(toggle)
+            self.file_toggles[label_text] = toggle
+
+            lbl = QLabel(label_text + ":")
+            lbl.setStyleSheet("color: white; font-weight: bold; font-size: 14px;")
+            lbl.setFixedWidth(120)
+            
+            path_edit = QLineEdit()
+            path_edit.setReadOnly(True)
+            path_edit.setPlaceholderText("Select...")
+            
+            btn = QPushButton("Browse")
+            btn.setFixedWidth(70)
+            # Pass field label so Pradaxina selection can auto-fill sibling PDF fields.
+            btn.clicked.connect(
+                lambda checked, le=path_edit, t=type_key, lt=label_text: self.browse_file(le, t, lt)
+            )
+
+            row.addWidget(lbl)
+            row.addWidget(path_edit)
+            row.addWidget(btn)
+            
+            # Add Preview button for PDFs
+            preview_btn = None
+            if type_key == "pdf":
+                preview_btn = QPushButton("⚙  Set Header")
+                preview_btn.setFixedWidth(110)
+                preview_btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #342a5c;
+                        color: #bca6ff;
+                        font-size: 11px;
+                        font-weight: bold;
+                        border: 1px solid #4c3b8a;
+                        border-radius: 8px;
+                        padding: 5px 10px;
+                    }
+                    QPushButton:hover {
+                        background-color: #433575;
+                        color: #ffffff;
+                        border: 1px solid #7c5cff;
+                    }
+                    QPushButton:pressed {
+                        background-color: #251d45;
+                    }
+                    QPushButton:disabled {
+                        background-color: #1e2128;
+                        color: #7c808c;
+                        border: 1px solid #2f3440;
+                    }
+                """)
+                preview_btn.clicked.connect(lambda checked, lt=label_text, le=path_edit: self.preview_pdf_header(lt, le))
+                row.addWidget(preview_btn)
+                
+                # Store default header height
+                self.header_heights[label_text] = default_header_h if default_header_h else 300
+
+            if toggle:
+                def make_toggle_handler(e_edit, e_btn, e_prev, l_text):
+                    def handler(checked):
+                        e_edit.setEnabled(checked)
+                        e_btn.setEnabled(checked)
+                        if e_prev:
+                            e_prev.setEnabled(checked)
+                        state_str = "ON" if checked else "OFF"
+                        self.log_area.append(f"[i] {l_text} toggled {state_str}")
+                        self.show_message(f"{l_text} toggled {state_str}", "info")
+                    return handler
+                toggle.toggled.connect(make_toggle_handler(path_edit, btn, preview_btn, label_text))
+            
+            form_layout.addLayout(row)
+            
+            # Store reference
+            self.file_inputs[label_text] = path_edit
+
+        # Apply persisted header defaults from previous runs
+        saved_headers = self.app_settings.get("header_heights", {})
+        if isinstance(saved_headers, dict):
+            for key, value in saved_headers.items():
+                if key in self.header_heights and isinstance(value, (int, float)):
+                    self.header_heights[key] = int(value)
+
+        # --- FPS Selection ---
+        fps_row = QHBoxLayout()
+        fps_row.setSpacing(10)
+        
+        fps_lbl = QLabel("Custom FPS:")
+        fps_lbl.setStyleSheet("color: white; font-weight: bold; font-size: 14px;")
+        fps_lbl.setFixedWidth(185)
+        
+        self.fps_toggle = ModernToggleSwitch()
+        
+        self.fps_slider = QSlider(Qt.Orientation.Horizontal)
+        self.fps_slider.setMinimum(10)
+        self.fps_slider.setMaximum(120)
+        self.fps_slider.setValue(35)
+        self.fps_slider.setEnabled(False)
+        self.fps_slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                border-radius: 4px;
+                height: 6px;
+                background: #1F2937;
+            }
+            QSlider::handle:horizontal {
+                background: #10B981;
+                width: 14px;
+                margin: -4px 0;
+                border-radius: 7px;
+            }
+            QSlider::handle:horizontal:disabled {
+                background: #374151;
+            }
+        """)
+        
+        self.fps_value_lbl = QLabel("35 FPS")
+        self.fps_value_lbl.setStyleSheet("color: #64748b; font-size: 13px; font-weight: bold;")
+        self.fps_value_lbl.setFixedWidth(50)
+        
+        self.fps_click_times = []
+
+        def on_fps_slider_changed(val):
+            self.fps_value_lbl.setText(f"{val} FPS")
+            
+        def on_fps_toggle(checked):
+            if checked:
+                import time
+                current_time = time.time()
+                # Prune clicks older than 60 seconds
+                self.fps_click_times = [t for t in self.fps_click_times if current_time - t <= 60]
+                self.fps_click_times.append(current_time)
+                
+                if len(self.fps_click_times) < 7:
+                    self.fps_toggle.blockSignals(True)
+                    self.fps_toggle.setChecked(False)
+                    self.fps_toggle.position = 0.0 # reset visual state
+                    self.fps_toggle.blockSignals(False)
+                    self.show_message("⚠ You are not permitted to change FPS.", "error")
+                    return
+
+            self.fps_slider.setEnabled(checked)
+            if not checked:
+                self.fps_slider.setValue(35)
+                self.fps_value_lbl.setStyleSheet("color: #64748b; font-size: 13px; font-weight: bold;")
+            else:
+                self.fps_value_lbl.setStyleSheet("color: #10B981; font-size: 13px; font-weight: bold;")
+                
+        self.fps_slider.valueChanged.connect(on_fps_slider_changed)
+        self.fps_toggle.toggled.connect(on_fps_toggle)
+        
+        fps_row.addWidget(fps_lbl)
+        fps_row.addWidget(self.fps_toggle)
+        fps_row.addWidget(self.fps_slider)
+        fps_row.addWidget(self.fps_value_lbl)
+        
+        form_layout.addLayout(fps_row)
+
+        # --- Audio Selection ---
+        audio_row = QHBoxLayout()
+        audio_row.setSpacing(5)
+
+        self.audio_lbl = QLabel("Audio Folder:")
+        self.audio_lbl.setStyleSheet("color: white; font-weight: bold; font-size: 14px;")
+        self.audio_lbl.setFixedWidth(185)
+
+        self.audio_folder_edit = QLineEdit()
+        self.audio_folder_edit.setReadOnly(True)
+        self.audio_folder_edit.setPlaceholderText("Select folder with your audio tracks...")
+
+        audio_browse_btn = QPushButton("Browse")
+        audio_browse_btn.setFixedWidth(70)
+        audio_browse_btn.clicked.connect(self.browse_audio_folder)
+
+        audio_row.addWidget(self.audio_lbl)
+        audio_row.addWidget(self.audio_folder_edit)
+        audio_row.addWidget(audio_browse_btn)
+        form_layout.addLayout(audio_row)
+
+        track_row = QHBoxLayout()
+        track_row.setSpacing(5)
+
+        track_lbl = QLabel("Audio Track:")
+        track_lbl.setStyleSheet("color: white; font-weight: bold; font-size: 14px;")
+        track_lbl.setFixedWidth(185)
+
+        self.audio_track_combo = QComboBox()
+        self.audio_track_combo.addItem("🔀 Auto (rotate daily)")
+        self.audio_track_combo.addItem("🎵 One track (fixed track)")
+        self.audio_track_combo.currentIndexChanged.connect(self.on_audio_mode_changed)
+        self.audio_track_combo.setToolTip(
+            "Auto picks one of the 19 tracks based on the selected date, so the same date "
+            "always loops the same track and each new day moves to the next one.\n"
+            "If you're not sure which to use, just leave this on Auto."
+        )
+
+        track_row.addWidget(track_lbl)
+        track_row.addWidget(self.audio_track_combo)
+        form_layout.addLayout(track_row)
+
+        # 3. Output Folder
+        out_row = QHBoxLayout()
+        out_row.setSpacing(5)
+        out_lbl = QLabel("Export Folder:")
+        out_lbl.setStyleSheet("color: white; font-weight: bold; font-size: 14px;")
+        out_lbl.setFixedWidth(185)
+        self.out_path_edit = QLineEdit()
+        self.out_path_edit.setReadOnly(True)
+        self.out_path_edit.setPlaceholderText("Select...")
+        out_btn = QPushButton("Browse")
+        out_btn.setFixedWidth(70)
+        out_btn.clicked.connect(self.browse_folder)
+        out_row.addWidget(out_lbl)
+        out_row.addWidget(self.out_path_edit)
+        out_row.addWidget(out_btn)
+        form_layout.addLayout(out_row)
+
+        # --- Progress Bar ---
+        progress_container = QWidget()
+        progress_layout = QVBoxLayout()
+        progress_layout.setSpacing(5)
+        progress_layout.setContentsMargins(0, 0, 0, 0)
+        progress_container.setLayout(progress_layout)
+        
+        # Message Banner (Above Progress Bar)
+        self.message_banner = QLabel("Jay Swaminarayan")
+        self.message_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.message_banner.setWordWrap(True)
+        self.message_banner.setFixedHeight(45)
+        self.message_banner.setStyleSheet("""
+            QLabel {
+                color: #64748b;
+                font-size: 14px;
+                font-weight: bold;
+                letter-spacing: 2px;
+                background-color: transparent;
+            }
+        """)
+        self.message_banner.linkActivated.connect(self.handle_message_link_clicked)
+        progress_layout.addWidget(self.message_banner)
+        
+        progress_label = QLabel("Progress:")
+        progress_label.setStyleSheet("font-size: 12px; color: #b4bac7; font-weight: bold; margin-top: 5px;")
+        progress_layout.addWidget(progress_label)
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMinimum(0)
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFixedHeight(20)
+        self.progress_bar.setFormat("%p%")
+        progress_layout.addWidget(self.progress_bar)
+        
+        layout.addWidget(progress_container)
+
+        # --- Progress & Log ---
+        self.log_area = QTextEdit()
+        self.log_area.setReadOnly(True)
+        self.log_area.setFixedHeight(120)
+        layout.addWidget(self.log_area)
+
+        # --- Buttons ---
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(8)
+        
+        self.start_btn = QPushButton("START PROCESSING")
+        self.start_btn.setFixedHeight(40)
+        self.start_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #10B981, stop:1 #059669);
+                color: #F8FAFC;
+                font-size: 13px;
+                font-weight: bold;
+                border: none;
+                border-radius: 8px;
+                padding: 8px 20px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #34D399, stop:1 #10B981);
+                border: 1px solid #059669;
+            }
+            QPushButton:pressed {
+                background: #059669;
+            }
+            QPushButton:disabled {
+                background-color: #111827;
+                color: #94A3B8;
+                border: 1px solid #334155;
+            }
+        """)
+        self.start_btn.clicked.connect(self.start_processing)
+        btn_layout.addWidget(self.start_btn)
+        
+        self.cancel_btn = QPushButton("CANCEL")
+        self.cancel_btn.setFixedHeight(40)
+        self.cancel_btn.setFixedWidth(120)
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #374151;
+                border: 1px solid #334155;
+                color: #ef4444; /* Keep Red for Cancel */
+                font-size: 13px;
+                font-weight: bold;
+                border-radius: 8px;
+                padding: 8px 20px;
+            }
+            QPushButton:hover {
+                background-color: #4B5563;
+                border: 1px solid #ef4444;
+            }
+            QPushButton:pressed {
+                background-color: #1F2937;
+            }
+            QPushButton:disabled {
+                background-color: #111827;
+                color: #94A3B8;
+                border: 1px solid #334155;
+            }
+        """)
+        self.cancel_btn.clicked.connect(self.cancel_processing)
+        btn_layout.addWidget(self.cancel_btn)
+        
+        self.clear_btn = QPushButton("CLEAR")
+        self.clear_btn.setFixedHeight(40)
+        self.clear_btn.setFixedWidth(120)
+        self.clear_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #374151;
+                border: 1px solid #334155;
+                color: #F8FAFC;
+                font-size: 13px;
+                font-weight: bold;
+                border-radius: 8px;
+                padding: 8px 20px;
+            }
+            QPushButton:hover {
+                background-color: #4B5563;
+                color: #F8FAFC;
+                border: 1px solid #10B981;
+            }
+            QPushButton:pressed {
+                background-color: #1F2937;
+            }
+            QPushButton:disabled {
+                background-color: #111827;
+                color: #94A3B8;
+                border: 1px solid #334155;
+            }
+        """)
+        self.clear_btn.clicked.connect(self.clear_ui)
+        btn_layout.addWidget(self.clear_btn)
+        
+        layout.addLayout(btn_layout)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.setFocus()
+
+    def open_new_instance(self):
+        # Launch a completely new and independent process of this application
+        import sys
+        kwargs = {}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        subprocess.Popen([sys.executable, sys.argv[0]], **kwargs)
+
+    def restart_app(self):
+        # Launch a new instance and then safely shut down this one
+        if hasattr(self, 'worker') and self.worker is not None and self.worker.isRunning():
+            reply = QMessageBox.question(self, "Restart Confirmation",
+                                         "A video is currently generating. Are you sure you want to cancel the export and restart?",
+                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                         QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
+                self._restart_pending = True
+                self.show_message("Canceling export and waiting to safely restart...", "warning")
+                self.cancel_processing()
+        else:
+            self.open_new_instance()
+            self.close()
+
+    def handle_exit(self):
+        if hasattr(self, 'worker') and self.worker is not None and self.worker.isRunning():
+            self.show_message("Exiting... Waiting for export to finalize securely.", "warning")
+            self._exit_pending = True
+            self.cancel_processing()
+        else:
+            self.close()
+
+    def closeEvent(self, event):
+        if hasattr(self, 'worker') and self.worker is not None and self.worker.isRunning():
+            self.show_message("Exiting... Waiting for export to finalize securely.", "warning")
+            self._exit_pending = True
+            self.cancel_processing()
+            event.ignore()
+        else:
+            event.accept()
+
+    def show_message(self, text, level="info"):
+        self.message_banner.setText(text)
+        if level == "success":
+            self.message_banner.setStyleSheet("""
+                QLabel {
+                    background-color: rgba(34, 197, 94, 0.1);
+                    color: #22c55e;
+                    border: 1px solid rgba(34, 197, 94, 0.4);
+                    border-radius: 8px;
+                    padding: 8px 14px;
+                    font-size: 13px;
+                    font-weight: bold;
+                    qproperty-alignment: AlignCenter;
+                }
+            """)
+        elif level == "error":
+            self.message_banner.setStyleSheet("""
+                QLabel {
+                    background-color: rgba(239, 68, 68, 0.1);
+                    color: #ef4444;
+                    border: 1px solid rgba(239, 68, 68, 0.4);
+                    border-radius: 8px;
+                    padding: 8px 14px;
+                    font-size: 13px;
+                    font-weight: bold;
+                    qproperty-alignment: AlignCenter;
+                }
+            """)
+        elif level == "warning":
+            self.message_banner.setStyleSheet("""
+                QLabel {
+                    background-color: rgba(245, 158, 11, 0.1);
+                    color: #f59e0b;
+                    border: 1px solid rgba(245, 158, 11, 0.4);
+                    border-radius: 8px;
+                    padding: 8px 14px;
+                    font-size: 13px;
+                    font-weight: bold;
+                    qproperty-alignment: AlignCenter;
+                }
+            """)
+        else: # info
+            self.message_banner.setStyleSheet("""
+                QLabel {
+                    background-color: rgba(139, 92, 246, 0.1);
+                    color: #a78bfa;
+                    border: 1px solid rgba(139, 92, 246, 0.4);
+                    border-radius: 8px;
+                    padding: 8px 14px;
+                    font-size: 13px;
+                    font-weight: bold;
+                    qproperty-alignment: AlignCenter;
+                }
+            """)
+
+    def clear_message(self):
+        self.message_banner.setText("Jay Swaminarayan")
+        self.message_banner.setStyleSheet("""
+            QLabel {
+                color: #64748b;
+                font-size: 14px;
+                font-weight: bold;
+                letter-spacing: 2px;
+                background-color: transparent;
+            }
+        """)
+
+    def handle_message_link_clicked(self, link):
+        if link == "open":
+            output_path = getattr(self.worker, 'output_video_path', '')
+            output_folder = os.path.dirname(output_path) if output_path else self.out_path_edit.text()
+            self.open_output_folder(output_folder)
+
+    def preview_pdf_header(self, label_text, line_edit):
+        """Open preview dialog to set header height for a PDF"""
+        if hasattr(self, 'worker') and self.worker is not None and self.worker.isRunning():
+            self.show_message("Cannot change settings while processing is active.", "warning")
+            return
+        
+        pdf_path = line_edit.text()
+        
+        if not pdf_path or not os.path.exists(pdf_path):
+            self.show_message(f"⚠ Please select a PDF file for '{label_text}' first.", "warning")
+            return
+        
+        # Get current header height
+        current_height = self.header_heights.get(label_text, 300)
+        
+        # Open preview dialog
+        dialog = PDFPreviewDialog(pdf_path, current_height, self)
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            new_height = dialog.get_header_height()
+            self.header_heights[label_text] = new_height
+
+            # Persist for future runs as default header height per section.
+            self.app_settings.setdefault("header_heights", {})[label_text] = int(new_height)
+            save_app_settings(self.app_settings)
+
+            self.show_message(f"✓ Header height for '{label_text}' set to {new_height}px (saved as default).", "success")
+    
+    def find_pdf_by_keywords(self, folder_path, keywords, exclude_paths=None):
+        """Return the best matching PDF in a folder using case-insensitive keyword matching."""
+        if not folder_path or not os.path.isdir(folder_path):
+            return None
+
+        exclude_set = set(os.path.normcase(p) for p in (exclude_paths or []))
+
+        best_path = None
+        best_score = -1
+
+        for entry in os.listdir(folder_path):
+            full_path = os.path.join(folder_path, entry)
+            if not os.path.isfile(full_path):
+                continue
+            if os.path.splitext(entry)[1].lower() != ".pdf":
+                continue
+            if os.path.normcase(full_path) in exclude_set:
+                continue
+
+            name_lower = os.path.splitext(entry)[0].lower()
+            score = sum(1 for kw in keywords if kw.lower() in name_lower)
+
+            if score > best_score and score > 0:
+                best_score = score
+                best_path = full_path
+
+        return best_path
+
+    def autofill_other_pdf_fields(self, source_path):
+        """Auto-fill other PDFs from the same folder as the selected PDF.
+        Only runs if no other PDF fields are currently filled (to prevent overwriting).
+        Also set export folder to the same directory."""
+        if not source_path or not os.path.exists(source_path):
+            return
+
+        # Check how many fields are currently filled
+        filled_count = 0
+        for label in ["Pradaxina PDF", "Dandvat PDF", "Dhun PDF", "Kirtan PDF"]:
+            edit = self.file_inputs.get(label)
+            if edit and edit.text().strip():
+                filled_count += 1
+        
+        # If more than 1 field is filled (the one just selected is already filled),
+        # then it means the user is manually picking another file after the first one. We shouldn't auto-fill.
+        if filled_count > 1:
+            return
+
+        source_folder = os.path.dirname(source_path)
+        filled_labels = []
+        excluded = [source_path]
+
+        keyword_map = {
+            "Pradaxina PDF": ["pradaxina", "pradakshina"],
+            "Dandvat PDF": ["dandvat", "dandawat", "dandavat"],
+            "Dhun PDF": ["dhun"],
+            "Kirtan PDF": ["kirtan", "kirtanam"]
+        }
+
+        for target_label, keywords in keyword_map.items():
+            target_edit = self.file_inputs.get(target_label)
+            if not target_edit:
+                continue
+
+            # Respect user's manual selection if field already has a valid file.
+            existing_path = target_edit.text().strip()
+            if existing_path and os.path.exists(existing_path):
+                excluded.append(existing_path)
+                continue
+
+            match_path = self.find_pdf_by_keywords(source_folder, keywords, exclude_paths=excluded)
+            if match_path:
+                target_edit.setText(match_path)
+                excluded.append(match_path)
+                filled_labels.append(target_label)
+
+        # Auto-set export folder to the same directory as the source PDF
+        self.out_path_edit.setText(source_folder)
+
+        if filled_labels:
+            friendly = ", ".join(label.replace(" PDF", "") for label in filled_labels)
+            self.log_area.append(f"[i] Auto-filled from folder: {friendly}")
+        
+        self.log_area.append(f"[i] Export folder set to: {source_folder}")
+
+    def browse_file(self, line_edit, file_type, label_text=""):
+        if hasattr(self, 'worker') and self.worker is not None and self.worker.isRunning():
+            self.show_message("Cannot change settings while processing is active.", "warning")
+            return
+            
+        dialog_title = f"Select {label_text}" if label_text else ("Select PDF" if file_type == "pdf" else "Select Image")
+        if file_type == "pdf":
+            fname, _ = QFileDialog.getOpenFileName(self, dialog_title, "", "PDF Files (*.pdf)")
+        else:
+            fname, _ = QFileDialog.getOpenFileName(self, dialog_title, "", "Images (*.jpg *.jpeg *.png)")
+
+        if fname:
+            line_edit.setText(fname)
+            if file_type == "pdf" and label_text in ["Pradaxina PDF", "Dandvat PDF", "Dhun PDF", "Kirtan PDF"]:
+                self.autofill_other_pdf_fields(fname)
+
+    def toggle_gpu_mode(self):
+        if hasattr(self, 'worker') and self.worker is not None and self.worker.isRunning():
+            self.show_message("Cannot change settings while processing is active.", "warning")
+            return
+            
+        if self.hardware_encoder:
+            # Switch to CPU
+            self.hardware_encoder = None
+            self.gpu_status_lbl.setText("Rendering on CPU (Software Encoding) [Forced]")
+            self.gpu_status_lbl.setStyleSheet("color: #eab308; font-weight: bold; font-size: 13px; margin-bottom: 8px; background: transparent;") # Yellow
+            self.gpu_switch_btn.setText("Switch to GPU")
+            self.show_message("Switched to CPU. Hardware Acceleration disabled (rendering will be slower).", "info")
+        else:
+            # Switch back to GPU
+            self.hardware_encoder = self.detected_hardware_encoder
+            self.gpu_status_lbl.setText(self.gpu_status_text_original)
+            self.gpu_status_lbl.setStyleSheet("color: #10B981; font-weight: bold; font-size: 13px; margin-bottom: 8px; background: transparent;") # Green
+            self.gpu_switch_btn.setText("Switch to CPU")
+            self.show_message("Switched to GPU. Hardware Acceleration enabled (rendering will be faster).", "info")
+
+    def browse_folder(self):
+        if hasattr(self, 'worker') and self.worker is not None and self.worker.isRunning():
+            self.show_message("Cannot change settings while processing is active.", "warning")
+            return
+            
+        folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
+        if folder:
+            self.out_path_edit.setText(folder)
+
+    def browse_audio_folder(self):
+        if hasattr(self, 'worker') and self.worker is not None and self.worker.isRunning():
+            self.show_message("Cannot change settings while processing is active.", "warning")
+            return
+
+        if self.audio_track_combo.currentIndex() == 1:
+            file_path, _ = QFileDialog.getOpenFileName(self, "Select Audio File", "", "Audio Files (*.mp3 *.wav *.m4a *.aac *.ogg)")
+            if file_path:
+                self.audio_folder_edit.setText(file_path)
+        else:
+            folder = QFileDialog.getExistingDirectory(self, "Select Audio Folder")
+            if not folder:
+                return
+            self.audio_folder_edit.setText(folder)
+            self.refresh_audio_tracks(folder)
+
+    def refresh_audio_tracks(self, folder):
+        """Rescan the audio folder and log how many tracks were found."""
+        tracks = list_audio_tracks(folder)
+        if tracks:
+            self.log_area.append(f"[i] Found {len(tracks)} audio track(s) in: {folder}")
+        else:
+            self.log_area.append(f"[!] No audio files found in: {folder}")
+
+    def on_audio_mode_changed(self, index):
+        if index == 1:
+            self.audio_lbl.setText("Audio File:")
+            self.audio_folder_edit.setPlaceholderText("Select your audio file...")
+            if os.path.isdir(self.audio_folder_edit.text()):
+                self.audio_folder_edit.clear()
+        else:
+            self.audio_lbl.setText("Audio Folder:")
+            self.audio_folder_edit.setPlaceholderText("Select folder with your audio tracks...")
+            if os.path.isfile(self.audio_folder_edit.text()):
+                self.audio_folder_edit.clear()
+
+
+    def cancel_processing(self):
+        if hasattr(self, 'worker') and self.worker is not None and self.worker.isRunning():
+            self.worker.is_cancelled = True
+            self.log_area.append("[!] Cancelling process...")
+
+    def clear_ui(self):
+        if hasattr(self, 'worker') and self.worker is not None and self.worker.isRunning():
+            self.show_message("Cannot clear while processing.", "warning")
+            return
+            
+        # Clear file inputs
+        for edit in self.file_inputs.values():
+            edit.clear()
+            
+        if hasattr(self, 'out_path_edit'):
+            self.out_path_edit.clear()
+        
+        # Clear progress & logs
+        self.log_area.clear()
+        self.clear_message()
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%p%")
+
+    def start_processing(self):
+        if hasattr(self, 'worker') and self.worker is not None and self.worker.isRunning():
+            self.show_message("Processing is already active.", "warning")
+            return
+
+        # Clear previous messages
+        self.clear_message()
+        
+        
+        # 1. Validation
+        paths = {}
+        for name, _, type_key in self.requirements:
+            if name in self.file_toggles and not self.file_toggles[name].isChecked():
+                continue
+            p = self.file_inputs[name].text()
+            if not p or not os.path.exists(p):
+                self.show_message(f"⚠ Missing File: Please select a valid file for: {name}", "warning")
+                return
+            paths[name] = p
+
+        out_folder = self.out_path_edit.text()
+        if not out_folder or not os.path.exists(out_folder):
+            self.show_message("⚠ Missing Folder: Please select a valid export folder.", "warning")
+            return
+
+        # 2. Prepare Config
+        date_str = self.date_input.date().toString("dd-MM-yyyy")
+        output_filename = f"{date_str}.mp4"
+        full_output_path = os.path.join(out_folder, output_filename)
+
+        # Construct PDF Config List with dynamic header heights
+        # Order: Pradaxina, Dandvat, Dhun, Kirtan
+        pdf_configurations = []
+        default_heights = {
+            "Pradaxina PDF": 334,
+            "Dandvat PDF": 372,
+            "Dhun PDF": 325,
+            "Kirtan PDF": 311
+        }
+        for name in ["Pradaxina PDF", "Dandvat PDF", "Dhun PDF", "Kirtan PDF"]:
+            if name in self.file_toggles and not self.file_toggles[name].isChecked():
+                continue
+            if name in paths:
+                pdf_configurations.append({
+                    "pdf_path": paths[name],
+                    "fixed_header_height_pixels": self.header_heights.get(name, default_heights[name])
+                })
+
+        ending_image = paths.get("Jay Swa. Photo")
+
+        # 3. Disable UI
+        self.start_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self.progress_bar.setValue(0)
+        self.current_eta_text = "--:--"
+        self.progress_bar.setFormat("0% | ETA: --:--")
+        self.log_area.clear()
+        self.log_area.append("[▶] Starting Process...")
+        
+        # Extract custom FPS
+        selected_fps = self.fps_slider.value() if self.fps_toggle.isChecked() else 35
+        
+        # Extract selected date
+        qdate = self.date_input.date()
+        selected_datetime = datetime(qdate.year(), qdate.month(), qdate.day())
+
+        # Resolve which audio track to use for this date
+        audio_folder = self.audio_folder_edit.text().strip()
+        manual_track = None
+        if self.audio_track_combo.currentIndex() > 0:  # index 0 is "Auto"
+            manual_track = self.audio_track_combo.currentText()
+        selected_audio_path = pick_daily_audio(audio_folder, selected_datetime, manual_filename=manual_track)
+
+        if audio_folder and not selected_audio_path:
+            self.log_area.append("[!] Audio folder set but no valid audio files found - rendering without audio.")
+        
+        # 4. Start Worker Thread
+        self.worker = VideoWorker(pdf_configurations, full_output_path, ending_image, 3, fps=selected_fps, hardware_encoder=self.hardware_encoder, selected_date=selected_datetime, audio_path=selected_audio_path)
+        self.worker.progress_signal.connect(self.update_log)
+        self.worker.progress_percent_signal.connect(self.update_progress)
+        self.worker.progress_eta_signal.connect(self.update_eta)
+        self.worker.finished_signal.connect(self.process_finished)
+        self.worker.start()
+
+    def update_log(self, text):
+        self.log_area.append(text)
+        # Auto scroll to bottom
+        sb = self.log_area.verticalScrollBar()
+        sb.setValue(sb.maximum())
+    
+    def update_progress(self, percent):
+        self.progress_bar.setValue(percent)
+        self.progress_bar.setFormat(f"{percent}% | ETA: {self.current_eta_text}")
+
+    def update_eta(self, eta_text):
+        self.current_eta_text = eta_text
+        self.progress_bar.setFormat(f"{self.progress_bar.value()}% | ETA: {self.current_eta_text}")
+
+    def open_output_folder(self, folder_path):
+        """Open the output folder in file explorer."""
+        if not folder_path or not os.path.exists(folder_path):
+            self.show_message(f"⚠ Folder Not Found: Could not find folder: {folder_path}", "warning")
+            return
+        
+        try:
+            if sys.platform == "win32":
+                os.startfile(folder_path)
+            elif sys.platform == "darwin":
+                os.system(f"open '{folder_path}'")
+            else:
+                os.system(f"xdg-open '{folder_path}'")
+        except Exception as e:
+            self.show_message(f"✗ Error: Could not open folder: {str(e)}", "error")
+
+    def process_finished(self, status_with_time):
+        # Parse status and elapsed time
+        status_parts = status_with_time.split("|")
+        status = status_parts[0]
+        elapsed_sec = int(status_parts[1]) if len(status_parts) > 1 else 0
+        
+        # Reset UI to normal state
+        self.start_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self.progress_bar.setValue(0 if status == "CANCELLED" else 100)
+        self.current_eta_text = "--:--"
+        self.progress_bar.setFormat("0% | ETA: --:--")
+        
+        if status == "SUCCESS":
+            self.progress_bar.setValue(100)
+            self.progress_bar.setFormat("100% | ETA: 00:00")
+            
+            # Format elapsed time
+            min_elapsed, sec_elapsed = divmod(elapsed_sec, 60)
+            time_str = f"{min_elapsed}m {sec_elapsed}s" if min_elapsed > 0 else f"{sec_elapsed}s"
+            
+            output_path = getattr(self.worker, 'output_video_path', '')
+            output_folder = os.path.dirname(output_path) if output_path else self.out_path_edit.text()
+            
+            success_msg = f"✓ Video Generated Successfully ({time_str})! " \
+                          f"Saved as: {self.date_input.date().toString('dd-MM-yyyy')}.mp4 | " \
+                          f"<a href=\"open\" style=\"color: #7c5cff; font-weight: bold; text-decoration: underline;\">Open Folder</a>"
+            self.show_message(success_msg, "success")
+            
+            self.log_area.append(f"[✓] PROCESS COMPLETE (Time: {time_str})")
+            
+            # Force window to the absolute top of all OS windows
+            self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized | Qt.WindowState.WindowActive)
+            self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+            self.show()
+            self.activateWindow()
+            self.raise_()
+            # Remove the always-on-top flag immediately so it doesn't stay permanently stuck above other apps
+            self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowStaysOnTopHint)
+            self.show()
+            
+        elif status == "CANCELLED":
+            self.progress_bar.setValue(0)
+            self.progress_bar.setFormat("0% | ETA: --:--")
+            self.show_message("⚠ Process cancelled by user.", "warning")
+            self.log_area.append("[!] PROCESS CANCELLED")
+            
+        else:
+            self.current_eta_text = "--:--"
+            self.progress_bar.setFormat(f"{self.progress_bar.value()}% | ETA: --:--")
+            self.show_message(f"✗ Process failed: {status}", "error")
+            self.log_area.append("[✗] PROCESS FAILED")
+
+        if getattr(self, '_restart_pending', False):
+            self.open_new_instance()
+            self._restart_pending = False
+            self.worker = None
+            self.close()
+        elif getattr(self, '_exit_pending', False):
+            self._exit_pending = False
+            self.worker = None
+            self.close()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(resource_path("icon.png")))
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())

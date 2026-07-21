@@ -1,0 +1,7 @@
+PyQt6
+PyPDF2
+reportlab
+PyMuPDF
+numpy
+opencv-python
+pyinstaller
